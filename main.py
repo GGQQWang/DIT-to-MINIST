@@ -299,7 +299,6 @@ def train_one_epoch(
     log_interval: int,
     grad_clip: float,
     contrastive_weight: float,
-    negative_classes: int,
     contrastive_temperature: float,
 ) -> float:
     model.train()
@@ -318,26 +317,20 @@ def train_one_epoch(
         denoise_loss = F.mse_loss(eps_pred, noise)
         class_loss = torch.zeros((), device=device)
 
-        if contrastive_weight > 0 and negative_classes > 0:
+        if contrastive_weight > 0:
             x_t_metric = x_t.detach()
             x0_target = x0.detach()
             class_errors = []
 
-            pos_eps = model(x_t_metric, t, labels)
-            pos_x0 = schedule.predict_x0(x_t_metric, t, pos_eps)
-            pos_err = F.mse_loss(pos_x0, x0_target, reduction="none").mean(dim=(1, 2))
-            class_errors.append(pos_err)
-
-            for _ in range(negative_classes):
-                neg_labels = sample_negative_labels(labels, model.cfg.num_classes)
-                neg_eps = model(x_t_metric, t, neg_labels)
-                neg_x0 = schedule.predict_x0(x_t_metric, t, neg_eps)
-                neg_err = F.mse_loss(neg_x0, x0_target, reduction="none").mean(dim=(1, 2))
-                class_errors.append(neg_err)
+            for cls in range(model.cfg.num_classes):
+                class_labels = torch.full_like(labels, cls)
+                class_eps = model(x_t_metric, t, class_labels)
+                class_x0 = schedule.predict_x0(x_t_metric, t, class_eps)
+                class_err = F.mse_loss(class_x0, x0_target, reduction="none").mean(dim=(1, 2))
+                class_errors.append(class_err)
 
             logits = -torch.stack(class_errors, dim=1) / contrastive_temperature
-            targets = torch.zeros(images.shape[0], device=device, dtype=torch.long)
-            class_loss = F.cross_entropy(logits, targets)
+            class_loss = F.cross_entropy(logits, labels)
 
         loss = denoise_loss + contrastive_weight * class_loss
 
@@ -360,12 +353,6 @@ def train_one_epoch(
                 f"class={total_class_loss / total_count:.6f}"
             )
     return total_loss / max(total_count, 1)
-
-
-def sample_negative_labels(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
-    negatives = torch.randint(0, num_classes - 1, labels.shape, device=labels.device)
-    return negatives + (negatives >= labels).long()
-
 
 @torch.no_grad()
 def classify_batch(
@@ -467,7 +454,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--label-drop-prob", type=float, default=0.0)
     parser.add_argument("--contrastive-weight", type=float, default=1.0)
-    parser.add_argument("--negative-classes", type=int, default=3)
     parser.add_argument("--contrastive-temperature", type=float, default=0.1)
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--eval-timesteps", default="100,300,500")
@@ -524,7 +510,6 @@ def main() -> None:
             args.log_interval,
             args.grad_clip,
             args.contrastive_weight,
-            args.negative_classes,
             args.contrastive_temperature,
         )
         acc = evaluate(model, test_loader, schedule, device, eval_timesteps, args.noise_repeats)
