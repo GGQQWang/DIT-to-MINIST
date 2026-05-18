@@ -298,9 +298,14 @@ def train_one_epoch(
     epoch: int,
     log_interval: int,
     grad_clip: float,
+    contrastive_weight: float,
+    negative_classes: int,
+    contrastive_temperature: float,
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_denoise_loss = 0.0
+    total_class_loss = 0.0
     total_count = 0
     for step, (images, labels) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True)
@@ -310,7 +315,31 @@ def train_one_epoch(
         t = torch.randint(0, schedule.timesteps, (images.shape[0],), device=device)
         x_t = schedule.q_sample(x0, t, noise)
         eps_pred = model(x_t, t, labels)
-        loss = F.mse_loss(eps_pred, noise)
+        denoise_loss = F.mse_loss(eps_pred, noise)
+        class_loss = torch.zeros((), device=device)
+
+        if contrastive_weight > 0 and negative_classes > 0:
+            x_t_metric = x_t.detach()
+            x0_target = x0.detach()
+            class_errors = []
+
+            pos_eps = model(x_t_metric, t, labels)
+            pos_x0 = schedule.predict_x0(x_t_metric, t, pos_eps)
+            pos_err = F.mse_loss(pos_x0, x0_target, reduction="none").mean(dim=(1, 2))
+            class_errors.append(pos_err)
+
+            for _ in range(negative_classes):
+                neg_labels = sample_negative_labels(labels, model.cfg.num_classes)
+                neg_eps = model(x_t_metric, t, neg_labels)
+                neg_x0 = schedule.predict_x0(x_t_metric, t, neg_eps)
+                neg_err = F.mse_loss(neg_x0, x0_target, reduction="none").mean(dim=(1, 2))
+                class_errors.append(neg_err)
+
+            logits = -torch.stack(class_errors, dim=1) / contrastive_temperature
+            targets = torch.zeros(images.shape[0], device=device, dtype=torch.long)
+            class_loss = F.cross_entropy(logits, targets)
+
+        loss = denoise_loss + contrastive_weight * class_loss
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -320,10 +349,22 @@ def train_one_epoch(
 
         batch_size = images.shape[0]
         total_loss += loss.item() * batch_size
+        total_denoise_loss += denoise_loss.item() * batch_size
+        total_class_loss += class_loss.item() * batch_size
         total_count += batch_size
         if step % log_interval == 0:
-            print(f"epoch={epoch} step={step}/{len(loader)} loss={total_loss / total_count:.6f}")
+            print(
+                f"epoch={epoch} step={step}/{len(loader)} "
+                f"loss={total_loss / total_count:.6f} "
+                f"denoise={total_denoise_loss / total_count:.6f} "
+                f"class={total_class_loss / total_count:.6f}"
+            )
     return total_loss / max(total_count, 1)
+
+
+def sample_negative_labels(labels: torch.Tensor, num_classes: int) -> torch.Tensor:
+    negatives = torch.randint(0, num_classes - 1, labels.shape, device=labels.device)
+    return negatives + (negatives >= labels).long()
 
 
 @torch.no_grad()
@@ -425,6 +466,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--label-drop-prob", type=float, default=0.0)
+    parser.add_argument("--contrastive-weight", type=float, default=1.0)
+    parser.add_argument("--negative-classes", type=int, default=3)
+    parser.add_argument("--contrastive-temperature", type=float, default=0.1)
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--eval-timesteps", default="100,300,500")
     parser.add_argument("--noise-repeats", type=int, default=1)
@@ -479,6 +523,9 @@ def main() -> None:
             epoch,
             args.log_interval,
             args.grad_clip,
+            args.contrastive_weight,
+            args.negative_classes,
+            args.contrastive_temperature,
         )
         acc = evaluate(model, test_loader, schedule, device, eval_timesteps, args.noise_repeats)
         save_checkpoint(args.checkpoint, model, optimizer, epoch, args)
