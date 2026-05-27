@@ -23,7 +23,6 @@ class DiTConfig:
     mlp_ratio: float = 4.0
     dropout: float = 0.0
     num_diffusion_steps: int = 1000
-    label_drop_prob: float = 0.0
 
 
 DIT_CONFIGS: Dict[str, Dict[str, int]] = {
@@ -73,26 +72,6 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.timestep_embedding(t, self.frequency_embedding_size))
-
-
-class LabelEmbedder(nn.Module):
-    def __init__(self, num_classes: int, hidden_size: int, drop_prob: float):
-        super().__init__()
-        self.num_classes = num_classes
-        self.drop_prob = drop_prob
-        self.embedding = nn.Embedding(num_classes + 1, hidden_size)
-
-    def token_drop(self, labels: torch.Tensor) -> torch.Tensor:
-        if self.drop_prob <= 0:
-            return labels
-        drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.drop_prob
-        labels = torch.where(drop_ids, self.num_classes, labels)
-        return labels
-
-    def forward(self, labels: torch.Tensor, train: bool) -> torch.Tensor:
-        if train:
-            labels = self.token_drop(labels)
-        return self.embedding(labels)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -149,14 +128,13 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
-class ConditionalDiT(nn.Module):
+class FeatureDenoisingDiT(nn.Module):
     def __init__(self, cfg: DiTConfig):
         super().__init__()
         self.cfg = cfg
         self.patch_embed = PatchEmbed(cfg.image_size, cfg.patch_size, cfg.in_channels, cfg.hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, cfg.hidden_size), requires_grad=False)
         self.t_embedder = TimestepEmbedder(cfg.hidden_size)
-        self.y_embedder = LabelEmbedder(cfg.num_classes, cfg.hidden_size, cfg.label_drop_prob)
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(cfg.hidden_size, cfg.num_heads, cfg.mlp_ratio, cfg.dropout)
@@ -177,7 +155,6 @@ class ConditionalDiT(nn.Module):
         self.pos_embed.data.copy_(get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.patch_embed.grid_size))
         nn.init.xavier_uniform_(self.patch_embed.proj.weight.view(self.patch_embed.proj.weight.shape[0], -1))
         nn.init.constant_(self.patch_embed.proj.bias, 0)
-        nn.init.normal_(self.y_embedder.embedding.weight, std=0.02)
 
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -190,8 +167,8 @@ class ConditionalDiT(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.patch_embed(x) + self.pos_embed
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        c = self.t_embedder(t) + self.y_embedder(y, self.training)
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        c = self.t_embedder(t)
         x = x_t
         for block in self.blocks:
             x = block(x, c)
@@ -250,7 +227,7 @@ class DiffusionSchedule:
         return (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
 
 
-def build_model(args: argparse.Namespace) -> ConditionalDiT:
+def build_model(args: argparse.Namespace) -> FeatureDenoisingDiT:
     size_cfg = DIT_CONFIGS[args.dit_size]
     cfg = DiTConfig(
         depth=size_cfg["depth"],
@@ -258,9 +235,8 @@ def build_model(args: argparse.Namespace) -> ConditionalDiT:
         num_heads=size_cfg["num_heads"],
         dropout=args.dropout,
         num_diffusion_steps=args.diffusion_steps,
-        label_drop_prob=args.label_drop_prob,
     )
-    return ConditionalDiT(cfg)
+    return FeatureDenoisingDiT(cfg)
 
 
 def get_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
@@ -290,7 +266,7 @@ def get_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
 
 
 def train_one_epoch(
-    model: ConditionalDiT,
+    model: FeatureDenoisingDiT,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     schedule: DiffusionSchedule,
@@ -298,41 +274,18 @@ def train_one_epoch(
     epoch: int,
     log_interval: int,
     grad_clip: float,
-    contrastive_weight: float,
-    contrastive_temperature: float,
 ) -> float:
     model.train()
     total_loss = 0.0
-    total_denoise_loss = 0.0
-    total_class_loss = 0.0
     total_count = 0
-    for step, (images, labels) in enumerate(loader, start=1):
+    for step, (images, _) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
         x0 = model.encode(images)
         noise = torch.randn_like(x0)
         t = torch.randint(0, schedule.timesteps, (images.shape[0],), device=device)
         x_t = schedule.q_sample(x0, t, noise)
-        eps_pred = model(x_t, t, labels)
-        denoise_loss = F.mse_loss(eps_pred, noise)
-        class_loss = torch.zeros((), device=device)
-
-        if contrastive_weight > 0:
-            x_t_metric = x_t.detach()
-            x0_target = x0.detach()
-            class_errors = []
-
-            for cls in range(model.cfg.num_classes):
-                class_labels = torch.full_like(labels, cls)
-                class_eps = model(x_t_metric, t, class_labels)
-                class_x0 = schedule.predict_x0(x_t_metric, t, class_eps)
-                class_err = F.mse_loss(class_x0, x0_target, reduction="none").mean(dim=(1, 2))
-                class_errors.append(class_err)
-
-            logits = -torch.stack(class_errors, dim=1) / contrastive_temperature
-            class_loss = F.cross_entropy(logits, labels)
-
-        loss = denoise_loss + contrastive_weight * class_loss
+        eps_pred = model(x_t, t)
+        loss = F.mse_loss(eps_pred, noise)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -342,70 +295,150 @@ def train_one_epoch(
 
         batch_size = images.shape[0]
         total_loss += loss.item() * batch_size
-        total_denoise_loss += denoise_loss.item() * batch_size
-        total_class_loss += class_loss.item() * batch_size
         total_count += batch_size
         if step % log_interval == 0:
-            print(
-                f"epoch={epoch} step={step}/{len(loader)} "
-                f"loss={total_loss / total_count:.6f} "
-                f"denoise={total_denoise_loss / total_count:.6f} "
-                f"class={total_class_loss / total_count:.6f}"
-            )
+            print(f"epoch={epoch} step={step}/{len(loader)} denoise_loss={total_loss / total_count:.6f}")
     return total_loss / max(total_count, 1)
 
+
 @torch.no_grad()
-def classify_batch(
-    model: ConditionalDiT,
-    images: torch.Tensor,
+def build_prototypes(
+    model: FeatureDenoisingDiT,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    image_sums = torch.zeros(model.cfg.num_classes, model.cfg.in_channels, model.cfg.image_size, model.cfg.image_size, device=device)
+    feature_sums = torch.zeros(
+        model.cfg.num_classes,
+        model.patch_embed.num_patches,
+        model.cfg.hidden_size,
+        device=device,
+    )
+    counts = torch.zeros(model.cfg.num_classes, device=device)
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        features = model.encode(images)
+        for cls in range(model.cfg.num_classes):
+            mask = labels == cls
+            if mask.any():
+                image_sums[cls] += images[mask].sum(dim=0)
+                feature_sums[cls] += features[mask].sum(dim=0)
+                counts[cls] += mask.sum()
+
+    counts = counts.clamp_min(1).view(-1, 1, 1, 1)
+    image_prototypes = image_sums / counts
+    feature_prototypes = feature_sums / counts.view(-1, 1, 1)
+    return image_prototypes, feature_prototypes
+
+
+def nearest_image_proto(images: torch.Tensor, image_prototypes: torch.Tensor) -> torch.Tensor:
+    errors = F.mse_loss(
+        images[:, None],
+        image_prototypes[None],
+        reduction="none",
+    ).mean(dim=(2, 3, 4))
+    return errors.argmin(dim=1)
+
+
+def nearest_feature_proto(features: torch.Tensor, feature_prototypes: torch.Tensor) -> torch.Tensor:
+    errors = F.mse_loss(
+        features[:, None],
+        feature_prototypes[None],
+        reduction="none",
+    ).mean(dim=(2, 3))
+    return errors.argmin(dim=1)
+
+
+@torch.no_grad()
+def denoise_features(
+    model: FeatureDenoisingDiT,
+    x0: torch.Tensor,
     schedule: DiffusionSchedule,
     device: torch.device,
     eval_timesteps: Iterable[int],
     noise_repeats: int,
 ) -> torch.Tensor:
-    model.eval()
-    images = images.to(device, non_blocking=True)
-    x0 = model.encode(images)
-    batch_size = images.shape[0]
-    class_errors = torch.zeros(batch_size, model.cfg.num_classes, device=device)
+    batch_size = x0.shape[0]
+    x0_pred_sum = torch.zeros_like(x0)
+    count = 0
 
     for timestep in eval_timesteps:
         t = torch.full((batch_size,), int(timestep), device=device, dtype=torch.long)
         for _ in range(noise_repeats):
             noise = torch.randn_like(x0)
             x_t = schedule.q_sample(x0, t, noise)
-            for cls in range(model.cfg.num_classes):
-                labels = torch.full((batch_size,), cls, device=device, dtype=torch.long)
-                eps_pred = model(x_t, t, labels)
-                x0_pred = schedule.predict_x0(x_t, t, eps_pred)
-                err = F.mse_loss(x0_pred, x0, reduction="none").mean(dim=(1, 2))
-                class_errors[:, cls] += err
+            eps_pred = model(x_t, t)
+            x0_pred_sum += schedule.predict_x0(x_t, t, eps_pred)
+            count += 1
 
-    return class_errors.argmin(dim=1)
+    return x0_pred_sum / max(count, 1)
 
 
 @torch.no_grad()
-def evaluate(
-    model: ConditionalDiT,
+def evaluate_prototypes(
+    model: FeatureDenoisingDiT,
     loader: DataLoader,
+    image_prototypes: torch.Tensor,
+    feature_prototypes: torch.Tensor,
     schedule: DiffusionSchedule,
     device: torch.device,
     eval_timesteps: Iterable[int],
     noise_repeats: int,
-) -> float:
+) -> Dict[str, float]:
+    model.eval()
+    correct = {
+        "image_clean": 0,
+        "image_noisy": 0,
+        "feature_clean": 0,
+        "feature_denoised": 0,
+    }
     total = 0
-    correct = 0
+
     for images, labels in loader:
+        images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        preds = classify_batch(model, images, schedule, device, eval_timesteps, noise_repeats)
-        correct += (preds == labels).sum().item()
+        x0 = model.encode(images)
+        noisy_images = denoise_image_baseline(images, schedule, device, eval_timesteps, noise_repeats)
+        x0_pred = denoise_features(model, x0, schedule, device, eval_timesteps, noise_repeats)
+
+        preds = {
+            "image_clean": nearest_image_proto(images, image_prototypes),
+            "image_noisy": nearest_image_proto(noisy_images, image_prototypes),
+            "feature_clean": nearest_feature_proto(x0, feature_prototypes),
+            "feature_denoised": nearest_feature_proto(x0_pred, feature_prototypes),
+        }
+        for name, pred in preds.items():
+            correct[name] += (pred == labels).sum().item()
         total += labels.numel()
-    return correct / max(total, 1)
+
+    return {name: value / max(total, 1) for name, value in correct.items()}
+
+
+@torch.no_grad()
+def denoise_image_baseline(
+    images: torch.Tensor,
+    schedule: DiffusionSchedule,
+    device: torch.device,
+    eval_timesteps: Iterable[int],
+    noise_repeats: int,
+) -> torch.Tensor:
+    image_sum = torch.zeros_like(images)
+    count = 0
+    for timestep in eval_timesteps:
+        t = torch.full((images.shape[0],), int(timestep), device=device, dtype=torch.long)
+        for _ in range(noise_repeats):
+            noise = torch.randn_like(images)
+            image_sum += schedule.q_sample(images, t, noise)
+            count += 1
+    return image_sum / max(count, 1)
 
 
 def save_checkpoint(
     path: str,
-    model: ConditionalDiT,
+    model: FeatureDenoisingDiT,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     args: argparse.Namespace,
@@ -422,7 +455,7 @@ def save_checkpoint(
     )
 
 
-def load_checkpoint(path: str, model: ConditionalDiT, device: torch.device, optimizer=None) -> int:
+def load_checkpoint(path: str, model: FeatureDenoisingDiT, device: torch.device, optimizer=None) -> int:
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
@@ -440,9 +473,20 @@ def parse_eval_timesteps(value: str, diffusion_steps: int) -> Tuple[int, ...]:
     return steps
 
 
+def parse_timestep_sweep(value: str, diffusion_steps: int) -> Tuple[Tuple[int, ...], ...]:
+    groups = []
+    for group in value.split(";"):
+        group = group.strip()
+        if group:
+            groups.append(parse_eval_timesteps(group, diffusion_steps))
+    if not groups:
+        raise ValueError("--timestep-sweep cannot be empty")
+    return tuple(groups)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Conditional DiT diffusion classifier for MNIST.")
-    parser.add_argument("--mode", choices=["train", "eval"], default="train")
+    parser = argparse.ArgumentParser(description="Unconditional DiT feature denoising with prototype matching for MNIST.")
+    parser.add_argument("--mode", choices=["train", "eval", "sweep"], default="train")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--checkpoint", default="./checkpoints/dit_mnist.pt")
     parser.add_argument("--dit-size", choices=sorted(DIT_CONFIGS), default="B")
@@ -452,11 +496,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--label-drop-prob", type=float, default=0.0)
-    parser.add_argument("--contrastive-weight", type=float, default=1.0)
-    parser.add_argument("--contrastive-temperature", type=float, default=0.1)
     parser.add_argument("--diffusion-steps", type=int, default=1000)
-    parser.add_argument("--eval-timesteps", default="100,300,500")
+    parser.add_argument("--eval-timesteps", default="50,100,150")
+    parser.add_argument(
+        "--timestep-sweep",
+        default="0;10;20;50;100;150;200;300;500;20,50,100;50,100,150;100,150,200",
+    )
     parser.add_argument("--noise-repeats", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=100)
@@ -476,6 +521,14 @@ def resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def format_metrics(metrics: Dict[str, float]) -> str:
+    return " ".join(f"{name}_acc={value:.4f}" for name, value in metrics.items())
+
+
+def format_timesteps(timesteps: Tuple[int, ...]) -> str:
+    return ",".join(str(step) for step in timesteps)
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -490,8 +543,35 @@ def main() -> None:
 
     if args.mode == "eval":
         load_checkpoint(args.checkpoint, model, device)
-        acc = evaluate(model, test_loader, schedule, device, eval_timesteps, args.noise_repeats)
-        print(f"test_acc={acc:.4f}")
+        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        metrics = evaluate_prototypes(
+            model,
+            test_loader,
+            image_prototypes,
+            feature_prototypes,
+            schedule,
+            device,
+            eval_timesteps,
+            args.noise_repeats,
+        )
+        print(format_metrics(metrics))
+        return
+
+    if args.mode == "sweep":
+        load_checkpoint(args.checkpoint, model, device)
+        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        for timestep_group in parse_timestep_sweep(args.timestep_sweep, args.diffusion_steps):
+            metrics = evaluate_prototypes(
+                model,
+                test_loader,
+                image_prototypes,
+                feature_prototypes,
+                schedule,
+                device,
+                timestep_group,
+                args.noise_repeats,
+            )
+            print(f"eval_timesteps={format_timesteps(timestep_group)} {format_metrics(metrics)}")
         return
 
     start_epoch = 0
@@ -509,12 +589,20 @@ def main() -> None:
             epoch,
             args.log_interval,
             args.grad_clip,
-            args.contrastive_weight,
-            args.contrastive_temperature,
         )
-        acc = evaluate(model, test_loader, schedule, device, eval_timesteps, args.noise_repeats)
+        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        metrics = evaluate_prototypes(
+            model,
+            test_loader,
+            image_prototypes,
+            feature_prototypes,
+            schedule,
+            device,
+            eval_timesteps,
+            args.noise_repeats,
+        )
         save_checkpoint(args.checkpoint, model, optimizer, epoch, args)
-        print(f"epoch={epoch} train_loss={loss:.6f} test_acc={acc:.4f} saved={args.checkpoint}")
+        print(f"epoch={epoch} train_loss={loss:.6f} {format_metrics(metrics)} saved={args.checkpoint}")
 
 
 if __name__ == "__main__":
