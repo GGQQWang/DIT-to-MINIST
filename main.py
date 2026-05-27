@@ -115,10 +115,10 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.linear = nn.Linear(hidden_size, out_channels)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size),
@@ -130,12 +130,13 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
-class FeatureDenoisingDiT(nn.Module):
+class ImageDenoisingDiT(nn.Module):
     def __init__(self, cfg: DiTConfig):
         super().__init__()
         self.cfg = cfg
         self.patch_embed = PatchEmbed(cfg.image_size, cfg.patch_size, cfg.in_channels, cfg.hidden_size)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches, cfg.hidden_size), requires_grad=False)
+        self.patch_dim = cfg.patch_size * cfg.patch_size * cfg.in_channels
         self.t_embedder = TimestepEmbedder(cfg.hidden_size)
         self.blocks = nn.ModuleList(
             [
@@ -143,7 +144,7 @@ class FeatureDenoisingDiT(nn.Module):
                 for _ in range(cfg.depth)
             ]
         )
-        self.final_layer = FinalLayer(cfg.hidden_size)
+        self.final_layer = FinalLayer(cfg.hidden_size, self.patch_dim)
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
@@ -169,12 +170,22 @@ class FeatureDenoisingDiT(nn.Module):
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         return self.patch_embed(x) + self.pos_embed
 
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.shape[0]
+        patch_size = self.cfg.patch_size
+        channels = self.cfg.in_channels
+        grid_size = self.patch_embed.grid_size
+        x = x.reshape(batch_size, grid_size, grid_size, patch_size, patch_size, channels)
+        x = torch.einsum("bhwpqc->bchpwq", x)
+        return x.reshape(batch_size, channels, grid_size * patch_size, grid_size * patch_size)
+
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         c = self.t_embedder(t)
-        x = x_t
+        x = self.encode(x_t)
         for block in self.blocks:
             x = block(x, c)
-        return self.final_layer(x, c)
+        patch_noise = self.final_layer(x, c)
+        return self.unpatchify(patch_noise)
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
@@ -231,7 +242,7 @@ class DiffusionSchedule:
         return (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
 
 
-def build_model(args: argparse.Namespace) -> FeatureDenoisingDiT:
+def build_model(args: argparse.Namespace) -> ImageDenoisingDiT:
     size_cfg = DIT_CONFIGS[args.dit_size]
     cfg = DiTConfig(
         depth=size_cfg["depth"],
@@ -240,7 +251,7 @@ def build_model(args: argparse.Namespace) -> FeatureDenoisingDiT:
         dropout=args.dropout,
         num_diffusion_steps=args.diffusion_steps,
     )
-    return FeatureDenoisingDiT(cfg)
+    return ImageDenoisingDiT(cfg)
 
 
 def get_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
@@ -270,7 +281,7 @@ def get_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
 
 
 def train_one_epoch(
-    model: FeatureDenoisingDiT,
+    model: ImageDenoisingDiT,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     schedule: DiffusionSchedule,
@@ -284,10 +295,9 @@ def train_one_epoch(
     total_count = 0
     for step, (images, _) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True)
-        x0 = model.encode(images)
-        noise = torch.randn_like(x0)
+        noise = torch.randn_like(images)
         t = torch.randint(0, schedule.timesteps, (images.shape[0],), device=device)
-        x_t = schedule.q_sample(x0, t, noise)
+        x_t = schedule.q_sample(images, t, noise)
         eps_pred = model(x_t, t)
         loss = F.mse_loss(eps_pred, noise)
 
@@ -307,86 +317,61 @@ def train_one_epoch(
 
 @torch.no_grad()
 def build_prototypes(
-    model: FeatureDenoisingDiT,
     loader: DataLoader,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    model.eval()
-    image_sums = torch.zeros(model.cfg.num_classes, model.cfg.in_channels, model.cfg.image_size, model.cfg.image_size, device=device)
-    feature_sums = torch.zeros(
-        model.cfg.num_classes,
-        model.patch_embed.num_patches,
-        model.cfg.hidden_size,
-        device=device,
-    )
-    counts = torch.zeros(model.cfg.num_classes, device=device)
+    num_classes: int = 10,
+) -> torch.Tensor:
+    image_sums = torch.zeros(num_classes, 1, 28, 28, device=device)
+    counts = torch.zeros(num_classes, device=device)
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        features = model.encode(images)
-        for cls in range(model.cfg.num_classes):
+        for cls in range(num_classes):
             mask = labels == cls
             if mask.any():
                 image_sums[cls] += images[mask].sum(dim=0)
-                feature_sums[cls] += features[mask].sum(dim=0)
                 counts[cls] += mask.sum()
 
     counts = counts.clamp_min(1).view(-1, 1, 1, 1)
-    image_prototypes = image_sums / counts
-    feature_prototypes = feature_sums / counts.view(-1, 1, 1)
-    return image_prototypes, feature_prototypes
+    return image_sums / counts
 
 
 def nearest_image_proto(images: torch.Tensor, image_prototypes: torch.Tensor) -> torch.Tensor:
-    errors = F.mse_loss(
-        images[:, None],
-        image_prototypes[None],
-        reduction="none",
-    ).mean(dim=(2, 3, 4))
-    return errors.argmin(dim=1)
-
-
-def nearest_feature_proto(features: torch.Tensor, feature_prototypes: torch.Tensor) -> torch.Tensor:
-    errors = F.mse_loss(
-        features[:, None],
-        feature_prototypes[None],
-        reduction="none",
-    ).mean(dim=(2, 3))
+    errors = (images[:, None] - image_prototypes[None]).pow(2).mean(dim=(2, 3, 4))
     return errors.argmin(dim=1)
 
 
 @torch.no_grad()
-def denoise_features(
-    model: FeatureDenoisingDiT,
-    x0: torch.Tensor,
+def denoise_images(
+    model: ImageDenoisingDiT,
+    images: torch.Tensor,
     schedule: DiffusionSchedule,
     device: torch.device,
     eval_timesteps: Iterable[int],
     noise_repeats: int,
 ) -> torch.Tensor:
-    batch_size = x0.shape[0]
-    x0_pred_sum = torch.zeros_like(x0)
+    batch_size = images.shape[0]
+    x0_pred_sum = torch.zeros_like(images)
     count = 0
 
     for timestep in eval_timesteps:
         t = torch.full((batch_size,), int(timestep), device=device, dtype=torch.long)
         for _ in range(noise_repeats):
-            noise = torch.randn_like(x0)
-            x_t = schedule.q_sample(x0, t, noise)
+            noise = torch.randn_like(images)
+            x_t = schedule.q_sample(images, t, noise)
             eps_pred = model(x_t, t)
             x0_pred_sum += schedule.predict_x0(x_t, t, eps_pred)
             count += 1
 
-    return x0_pred_sum / max(count, 1)
+    return (x0_pred_sum / max(count, 1)).clamp(-1, 1)
 
 
 @torch.no_grad()
 def evaluate_prototypes(
-    model: FeatureDenoisingDiT,
+    model: ImageDenoisingDiT,
     loader: DataLoader,
     image_prototypes: torch.Tensor,
-    feature_prototypes: torch.Tensor,
     schedule: DiffusionSchedule,
     device: torch.device,
     eval_timesteps: Iterable[int],
@@ -396,8 +381,7 @@ def evaluate_prototypes(
     correct = {
         "image_clean": 0,
         "image_noisy": 0,
-        "feature_clean": 0,
-        "feature_denoised": 0,
+        "image_denoised": 0,
     }
     confusion = torch.zeros(model.cfg.num_classes, model.cfg.num_classes, dtype=torch.long)
     total = 0
@@ -405,19 +389,17 @@ def evaluate_prototypes(
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        x0 = model.encode(images)
         noisy_images = denoise_image_baseline(images, schedule, device, eval_timesteps, noise_repeats)
-        x0_pred = denoise_features(model, x0, schedule, device, eval_timesteps, noise_repeats)
+        denoised_images = denoise_images(model, images, schedule, device, eval_timesteps, noise_repeats)
 
         preds = {
             "image_clean": nearest_image_proto(images, image_prototypes),
             "image_noisy": nearest_image_proto(noisy_images, image_prototypes),
-            "feature_clean": nearest_feature_proto(x0, feature_prototypes),
-            "feature_denoised": nearest_feature_proto(x0_pred, feature_prototypes),
+            "image_denoised": nearest_image_proto(denoised_images, image_prototypes),
         }
         for name, pred in preds.items():
             correct[name] += (pred == labels).sum().item()
-        for true_label, pred_label in zip(labels.cpu(), preds["feature_denoised"].cpu()):
+        for true_label, pred_label in zip(labels.cpu(), preds["image_denoised"].cpu()):
             confusion[true_label.long(), pred_label.long()] += 1
         total += labels.numel()
 
@@ -446,7 +428,7 @@ def denoise_image_baseline(
 
 def save_checkpoint(
     path: str,
-    model: FeatureDenoisingDiT,
+    model: ImageDenoisingDiT,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     args: argparse.Namespace,
@@ -463,7 +445,7 @@ def save_checkpoint(
     )
 
 
-def load_checkpoint(path: str, model: FeatureDenoisingDiT, device: torch.device, optimizer=None) -> int:
+def load_checkpoint(path: str, model: ImageDenoisingDiT, device: torch.device, optimizer=None) -> int:
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
@@ -493,7 +475,7 @@ def parse_timestep_sweep(value: str, diffusion_steps: int) -> Tuple[Tuple[int, .
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unconditional DiT feature denoising with prototype matching for MNIST.")
+    parser = argparse.ArgumentParser(description="Unconditional DiT image denoising with prototype matching for MNIST.")
     parser.add_argument("--mode", choices=["train", "eval", "sweep"], default="train")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--checkpoint", default="./checkpoints/dit_mnist.pt")
@@ -603,6 +585,33 @@ def save_noise_grid(
     save_image(grid_images, path, nrow=max_images, padding=2)
 
 
+@torch.no_grad()
+def save_denoising_grid(
+    path: str,
+    model: ImageDenoisingDiT,
+    loader: DataLoader,
+    schedule: DiffusionSchedule,
+    device: torch.device,
+    timesteps: Iterable[int],
+    max_images: int = 8,
+) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    model.eval()
+    images, _ = next(iter(loader))
+    images = images[:max_images].to(device)
+    rows = [images]
+    for timestep in timesteps:
+        t = torch.full((images.shape[0],), int(timestep), device=device, dtype=torch.long)
+        noise = torch.randn_like(images)
+        x_t = schedule.q_sample(images, t, noise)
+        eps_pred = model(x_t, t)
+        rows.append(x_t)
+        rows.append(schedule.predict_x0(x_t, t, eps_pred).clamp(-1, 1))
+    grid_images = torch.cat(rows, dim=0)
+    grid_images = (grid_images.detach().cpu().clamp(-1, 1) + 1) / 2
+    save_image(grid_images, path, nrow=max_images, padding=2)
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -620,25 +629,25 @@ def main() -> None:
 
     if args.mode == "eval":
         load_checkpoint(args.checkpoint, model, device)
-        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
         save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
+        save_denoising_grid(os.path.join(args.output_dir, "denoising_grid.png"), model, test_loader, schedule, device, eval_timesteps)
         metrics, confusion = evaluate_prototypes(
             model,
             test_loader,
             image_prototypes,
-            feature_prototypes,
             schedule,
             device,
             eval_timesteps,
             args.noise_repeats,
         )
-        write_confusion_csv(os.path.join(args.output_dir, "confusion_feature_denoised.csv"), confusion)
+        write_confusion_csv(os.path.join(args.output_dir, "confusion_image_denoised.csv"), confusion)
         print(format_metrics(metrics))
         return
 
     if args.mode == "sweep":
         load_checkpoint(args.checkpoint, model, device)
-        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
         save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
         sweep_rows = []
         for timestep_group in parse_timestep_sweep(args.timestep_sweep, args.diffusion_steps):
@@ -646,7 +655,6 @@ def main() -> None:
                 model,
                 test_loader,
                 image_prototypes,
-                feature_prototypes,
                 schedule,
                 device,
                 timestep_group,
@@ -656,7 +664,7 @@ def main() -> None:
             row.update(metrics)
             sweep_rows.append(row)
             write_confusion_csv(
-                os.path.join(args.output_dir, f"confusion_feature_denoised_t{format_timesteps(timestep_group).replace(',', '_')}.csv"),
+                os.path.join(args.output_dir, f"confusion_image_denoised_t{format_timesteps(timestep_group).replace(',', '_')}.csv"),
                 confusion,
             )
             print(f"eval_timesteps={format_timesteps(timestep_group)} {format_metrics(metrics)}")
@@ -679,20 +687,20 @@ def main() -> None:
             args.log_interval,
             args.grad_clip,
         )
-        image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
         save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
+        save_denoising_grid(os.path.join(args.output_dir, "denoising_grid.png"), model, test_loader, schedule, device, eval_timesteps)
         metrics, confusion = evaluate_prototypes(
             model,
             test_loader,
             image_prototypes,
-            feature_prototypes,
             schedule,
             device,
             eval_timesteps,
             args.noise_repeats,
         )
         append_training_log(os.path.join(args.output_dir, "train_metrics.csv"), epoch, loss, metrics)
-        write_confusion_csv(os.path.join(args.output_dir, "confusion_feature_denoised.csv"), confusion)
+        write_confusion_csv(os.path.join(args.output_dir, "confusion_image_denoised.csv"), confusion)
         save_checkpoint(args.checkpoint, model, optimizer, epoch, args)
         print(f"epoch={epoch} train_loss={loss:.6f} {format_metrics(metrics)} saved={args.checkpoint}")
 
