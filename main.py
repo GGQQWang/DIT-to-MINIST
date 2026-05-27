@@ -1,4 +1,5 @@
 import argparse
+import csv
 import math
 import os
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torchvision.utils import save_image
 
 
 @dataclass
@@ -217,13 +219,15 @@ class DiffusionSchedule:
         self.sqrt_one_minus_alpha_bars = torch.sqrt(1.0 - alpha_bars)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        sqrt_ab = self.sqrt_alpha_bars[t].view(-1, 1, 1)
-        sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(-1, 1, 1)
+        shape = (t.shape[0],) + (1,) * (x0.dim() - 1)
+        sqrt_ab = self.sqrt_alpha_bars[t].view(shape)
+        sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(shape)
         return sqrt_ab * x0 + sqrt_omab * noise
 
     def predict_x0(self, x_t: torch.Tensor, t: torch.Tensor, eps_pred: torch.Tensor) -> torch.Tensor:
-        sqrt_ab = self.sqrt_alpha_bars[t].view(-1, 1, 1)
-        sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(-1, 1, 1)
+        shape = (t.shape[0],) + (1,) * (x_t.dim() - 1)
+        sqrt_ab = self.sqrt_alpha_bars[t].view(shape)
+        sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(shape)
         return (x_t - sqrt_omab * eps_pred) / sqrt_ab.clamp_min(1e-8)
 
 
@@ -387,7 +391,7 @@ def evaluate_prototypes(
     device: torch.device,
     eval_timesteps: Iterable[int],
     noise_repeats: int,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], torch.Tensor]:
     model.eval()
     correct = {
         "image_clean": 0,
@@ -395,6 +399,7 @@ def evaluate_prototypes(
         "feature_clean": 0,
         "feature_denoised": 0,
     }
+    confusion = torch.zeros(model.cfg.num_classes, model.cfg.num_classes, dtype=torch.long)
     total = 0
 
     for images, labels in loader:
@@ -412,9 +417,12 @@ def evaluate_prototypes(
         }
         for name, pred in preds.items():
             correct[name] += (pred == labels).sum().item()
+        for true_label, pred_label in zip(labels.cpu(), preds["feature_denoised"].cpu()):
+            confusion[true_label.long(), pred_label.long()] += 1
         total += labels.numel()
 
-    return {name: value / max(total, 1) for name, value in correct.items()}
+    metrics = {name: value / max(total, 1) for name, value in correct.items()}
+    return metrics, confusion
 
 
 @torch.no_grad()
@@ -502,6 +510,8 @@ def parse_args() -> argparse.Namespace:
         "--timestep-sweep",
         default="0;10;20;50;100;150;200;300;500;20,50,100;50,100,150;100,150,200",
     )
+    parser.add_argument("--viz-timesteps", default="0,20,50,100,150,200,300,500")
+    parser.add_argument("--output-dir", default="./outputs")
     parser.add_argument("--noise-repeats", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--log-interval", type=int, default=100)
@@ -529,6 +539,70 @@ def format_timesteps(timesteps: Tuple[int, ...]) -> str:
     return ",".join(str(step) for step in timesteps)
 
 
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def append_training_log(path: str, epoch: int, train_loss: float, metrics: Dict[str, float]) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    fieldnames = ["epoch", "train_loss", *metrics.keys()]
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        row = {"epoch": epoch, "train_loss": train_loss}
+        row.update(metrics)
+        writer.writerow(row)
+
+
+def write_sweep_log(path: str, rows: Iterable[Dict[str, float]]) -> None:
+    rows = list(rows)
+    if not rows:
+        return
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_confusion_csv(path: str, confusion: torch.Tensor) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["true\\pred", *range(confusion.shape[1])])
+        for cls, row in enumerate(confusion.tolist()):
+            writer.writerow([cls, *row])
+
+
+def save_image_prototypes(path: str, image_prototypes: torch.Tensor) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    images = (image_prototypes.detach().cpu().clamp(-1, 1) + 1) / 2
+    save_image(images, path, nrow=image_prototypes.shape[0], padding=2)
+
+
+@torch.no_grad()
+def save_noise_grid(
+    path: str,
+    loader: DataLoader,
+    schedule: DiffusionSchedule,
+    device: torch.device,
+    timesteps: Iterable[int],
+    max_images: int = 8,
+) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    images, _ = next(iter(loader))
+    images = images[:max_images].to(device)
+    rows = [images]
+    for timestep in timesteps:
+        t = torch.full((images.shape[0],), int(timestep), device=device, dtype=torch.long)
+        rows.append(schedule.q_sample(images, t, torch.randn_like(images)))
+    grid_images = torch.cat(rows, dim=0)
+    grid_images = (grid_images.detach().cpu().clamp(-1, 1) + 1) / 2
+    save_image(grid_images, path, nrow=max_images, padding=2)
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -538,13 +612,17 @@ def main() -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     schedule = DiffusionSchedule(args.diffusion_steps, device)
     eval_timesteps = parse_eval_timesteps(args.eval_timesteps, args.diffusion_steps)
+    viz_timesteps = parse_eval_timesteps(args.viz_timesteps, args.diffusion_steps)
+    ensure_dir(args.output_dir)
+    save_noise_grid(os.path.join(args.output_dir, "noise_grid.png"), train_loader, schedule, device, viz_timesteps)
 
     print(f"device={device} dit={args.dit_size} params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     if args.mode == "eval":
         load_checkpoint(args.checkpoint, model, device)
         image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
-        metrics = evaluate_prototypes(
+        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
+        metrics, confusion = evaluate_prototypes(
             model,
             test_loader,
             image_prototypes,
@@ -554,14 +632,17 @@ def main() -> None:
             eval_timesteps,
             args.noise_repeats,
         )
+        write_confusion_csv(os.path.join(args.output_dir, "confusion_feature_denoised.csv"), confusion)
         print(format_metrics(metrics))
         return
 
     if args.mode == "sweep":
         load_checkpoint(args.checkpoint, model, device)
         image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
+        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
+        sweep_rows = []
         for timestep_group in parse_timestep_sweep(args.timestep_sweep, args.diffusion_steps):
-            metrics = evaluate_prototypes(
+            metrics, confusion = evaluate_prototypes(
                 model,
                 test_loader,
                 image_prototypes,
@@ -571,7 +652,15 @@ def main() -> None:
                 timestep_group,
                 args.noise_repeats,
             )
+            row = {"eval_timesteps": format_timesteps(timestep_group)}
+            row.update(metrics)
+            sweep_rows.append(row)
+            write_confusion_csv(
+                os.path.join(args.output_dir, f"confusion_feature_denoised_t{format_timesteps(timestep_group).replace(',', '_')}.csv"),
+                confusion,
+            )
             print(f"eval_timesteps={format_timesteps(timestep_group)} {format_metrics(metrics)}")
+        write_sweep_log(os.path.join(args.output_dir, "sweep_metrics.csv"), sweep_rows)
         return
 
     start_epoch = 0
@@ -591,7 +680,8 @@ def main() -> None:
             args.grad_clip,
         )
         image_prototypes, feature_prototypes = build_prototypes(model, train_loader, device)
-        metrics = evaluate_prototypes(
+        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
+        metrics, confusion = evaluate_prototypes(
             model,
             test_loader,
             image_prototypes,
@@ -601,6 +691,8 @@ def main() -> None:
             eval_timesteps,
             args.noise_repeats,
         )
+        append_training_log(os.path.join(args.output_dir, "train_metrics.csv"), epoch, loss, metrics)
+        write_confusion_csv(os.path.join(args.output_dir, "confusion_feature_denoised.csv"), confusion)
         save_checkpoint(args.checkpoint, model, optimizer, epoch, args)
         print(f"epoch={epoch} train_loss={loss:.6f} {format_metrics(metrics)} saved={args.checkpoint}")
 
