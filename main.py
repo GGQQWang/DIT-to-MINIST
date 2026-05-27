@@ -289,17 +289,28 @@ def train_one_epoch(
     epoch: int,
     log_interval: int,
     grad_clip: float,
+    image_prototypes: torch.Tensor,
+    target_mode: str,
+    train_timestep_min: int,
+    train_timestep_max: int,
 ) -> float:
     model.train()
     total_loss = 0.0
     total_count = 0
-    for step, (images, _) in enumerate(loader, start=1):
+    for step, (images, labels) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         noise = torch.randn_like(images)
-        t = torch.randint(0, schedule.timesteps, (images.shape[0],), device=device)
+        t = torch.randint(train_timestep_min, train_timestep_max + 1, (images.shape[0],), device=device)
         x_t = schedule.q_sample(images, t, noise)
         eps_pred = model(x_t, t)
-        loss = F.mse_loss(eps_pred, noise)
+        if target_mode == "noise":
+            loss = F.mse_loss(eps_pred, noise)
+        elif target_mode == "prototype":
+            x0_pred = schedule.predict_x0(x_t, t, eps_pred).clamp(-1, 1)
+            loss = F.mse_loss(x0_pred, image_prototypes[labels])
+        else:
+            raise ValueError(f"Unsupported target_mode: {target_mode}")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -487,6 +498,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--diffusion-steps", type=int, default=1000)
+    parser.add_argument("--target-mode", choices=["noise", "prototype"], default="prototype")
+    parser.add_argument("--train-timestep-min", type=int, default=250)
+    parser.add_argument("--train-timestep-max", type=int, default=350)
     parser.add_argument("--eval-timesteps", default="50,100,150")
     parser.add_argument(
         "--timestep-sweep",
@@ -620,17 +634,25 @@ def main() -> None:
     model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     schedule = DiffusionSchedule(args.diffusion_steps, device)
+    if args.train_timestep_min < 0 or args.train_timestep_max >= args.diffusion_steps:
+        raise ValueError("--train-timestep-min/max must be inside the diffusion step range")
+    if args.train_timestep_min > args.train_timestep_max:
+        raise ValueError("--train-timestep-min cannot be larger than --train-timestep-max")
     eval_timesteps = parse_eval_timesteps(args.eval_timesteps, args.diffusion_steps)
     viz_timesteps = parse_eval_timesteps(args.viz_timesteps, args.diffusion_steps)
     ensure_dir(args.output_dir)
     save_noise_grid(os.path.join(args.output_dir, "noise_grid.png"), train_loader, schedule, device, viz_timesteps)
+    image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
+    save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
 
-    print(f"device={device} dit={args.dit_size} params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(
+        f"device={device} dit={args.dit_size} "
+        f"params={sum(p.numel() for p in model.parameters()) / 1e6:.2f}M "
+        f"target_mode={args.target_mode} train_t={args.train_timestep_min}-{args.train_timestep_max}"
+    )
 
     if args.mode == "eval":
         load_checkpoint(args.checkpoint, model, device)
-        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
-        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
         save_denoising_grid(os.path.join(args.output_dir, "denoising_grid.png"), model, test_loader, schedule, device, eval_timesteps)
         metrics, confusion = evaluate_prototypes(
             model,
@@ -647,8 +669,6 @@ def main() -> None:
 
     if args.mode == "sweep":
         load_checkpoint(args.checkpoint, model, device)
-        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
-        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
         sweep_rows = []
         for timestep_group in parse_timestep_sweep(args.timestep_sweep, args.diffusion_steps):
             metrics, confusion = evaluate_prototypes(
@@ -686,9 +706,11 @@ def main() -> None:
             epoch,
             args.log_interval,
             args.grad_clip,
+            image_prototypes,
+            args.target_mode,
+            args.train_timestep_min,
+            args.train_timestep_max,
         )
-        image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
-        save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
         save_denoising_grid(os.path.join(args.output_dir, "denoising_grid.png"), model, test_loader, schedule, device, eval_timesteps)
         metrics, confusion = evaluate_prototypes(
             model,
