@@ -3,7 +3,7 @@ import csv
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,21 +52,39 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def balanced_subset_indices(dataset, per_class: int, num_classes: int, seed: int) -> List[int]:
-    if per_class <= 0:
-        return list(range(len(dataset)))
-
+def balanced_subset_indices_from_pool(pool: Sequence[int], labels: torch.Tensor, per_class: int, num_classes: int, seed: int) -> List[int]:
     generator = torch.Generator().manual_seed(seed)
-    labels = torch.as_tensor(dataset.targets)
+    pool_tensor = torch.as_tensor(list(pool), dtype=torch.long)
     indices: List[int] = []
     for cls in range(num_classes):
-        cls_indices = torch.where(labels == cls)[0]
+        cls_indices = pool_tensor[labels[pool_tensor] == cls]
         perm = torch.randperm(cls_indices.numel(), generator=generator)
-        indices.extend(cls_indices[perm[: min(per_class, cls_indices.numel())]].tolist())
+        take = cls_indices.numel() if per_class <= 0 else min(per_class, cls_indices.numel())
+        indices.extend(cls_indices[perm[:take]].tolist())
     return indices
 
 
-def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+def split_train_val_indices(dataset, args: argparse.Namespace) -> Tuple[List[int], List[int]]:
+    labels = torch.as_tensor(dataset.targets)
+    generator = torch.Generator().manual_seed(args.seed)
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+
+    for cls in range(args.num_classes):
+        cls_indices = torch.where(labels == cls)[0]
+        permuted = cls_indices[torch.randperm(cls_indices.numel(), generator=generator)]
+        val_take = min(args.val_per_class, cls_indices.numel())
+        val_cls = permuted[:val_take]
+        train_pool = permuted[val_take:]
+        train_take = train_pool.numel() if args.train_per_class <= 0 else min(args.train_per_class, train_pool.numel())
+        train_cls = train_pool[:train_take]
+        val_indices.extend(val_cls.tolist())
+        train_indices.extend(train_cls.tolist())
+
+    return train_indices, val_indices
+
+
+def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -74,9 +92,15 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
         ]
     )
     train_set = datasets.MNIST(args.data_dir, train=True, download=True, transform=transform)
-    eval_set = datasets.MNIST(args.data_dir, train=False, download=True, transform=transform)
-    train_indices = balanced_subset_indices(train_set, args.train_per_class, args.num_classes, args.seed)
-    eval_indices = balanced_subset_indices(eval_set, args.eval_per_class, args.num_classes, args.seed + 1000)
+    test_set = datasets.MNIST(args.data_dir, train=False, download=True, transform=transform)
+    train_indices, val_indices = split_train_val_indices(train_set, args)
+    test_indices = balanced_subset_indices_from_pool(
+        range(len(test_set)),
+        torch.as_tensor(test_set.targets),
+        args.test_per_class,
+        args.num_classes,
+        args.seed + 1000,
+    )
     train_loader = DataLoader(
         Subset(train_set, train_indices),
         batch_size=args.batch_size,
@@ -84,21 +108,28 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
-    eval_loader = DataLoader(
-        Subset(eval_set, eval_indices),
+    val_loader = DataLoader(
+        Subset(train_set, val_indices),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        Subset(test_set, test_indices),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
     prototype_loader = DataLoader(
-        train_set,
+        Subset(train_set, train_indices),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
-    return train_loader, eval_loader, prototype_loader
+    return train_loader, val_loader, test_loader, prototype_loader
 
 
 class DiffusionSchedule:
@@ -197,6 +228,51 @@ class CNNAttractor(nn.Module):
         time = self.time_proj(self.t_embedder(t)).view(x.shape[0], -1, 1, 1)
         h = h + time
         return self.out_conv(self.blocks(h)).clamp(-1, 1)
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int, time_dim: int):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(8, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.time_proj = nn.Linear(time_dim, channels)
+
+    def forward(self, x: torch.Tensor, time_embedding: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.time_proj(time_embedding).view(x.shape[0], -1, 1, 1)
+        h = self.conv2(F.silu(self.norm2(h)))
+        return x + h
+
+
+class StrongCNNAttractor(nn.Module):
+    def __init__(self, base_channels: int = 64, time_dim: int = 256):
+        super().__init__()
+        self.t_embedder = TimestepEmbedder(time_dim)
+        self.in_conv = nn.Conv2d(1, base_channels, kernel_size=3, padding=1)
+        self.enc1 = ResidualConvBlock(base_channels, time_dim)
+        self.down1 = nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1)
+        self.enc2 = ResidualConvBlock(base_channels * 2, time_dim)
+        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1)
+        self.mid1 = ResidualConvBlock(base_channels * 4, time_dim)
+        self.mid2 = ResidualConvBlock(base_channels * 4, time_dim)
+        self.up1 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=4, stride=2, padding=1)
+        self.dec1 = ResidualConvBlock(base_channels * 2, time_dim)
+        self.up2 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.dec2 = ResidualConvBlock(base_channels, time_dim)
+        self.out_norm = nn.GroupNorm(8, base_channels)
+        self.out_conv = nn.Conv2d(base_channels, 1, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        time_embedding = self.t_embedder(t)
+        h1 = self.enc1(self.in_conv(x), time_embedding)
+        h2 = self.enc2(self.down1(h1), time_embedding)
+        h = self.down2(h2)
+        h = self.mid2(self.mid1(h, time_embedding), time_embedding)
+        h = self.dec1(self.up1(h) + h2, time_embedding)
+        h = self.dec2(self.up2(h) + h1, time_embedding)
+        return self.out_conv(F.silu(self.out_norm(h))).clamp(-1, 1)
 
 
 class PatchEmbed(nn.Module):
@@ -345,6 +421,8 @@ def build_model(args: argparse.Namespace) -> nn.Module:
         return MLPAttractor(args.mlp_hidden_size)
     if args.model == "cnn":
         return CNNAttractor(args.cnn_channels)
+    if args.model == "cnn-strong":
+        return StrongCNNAttractor(args.cnn_channels)
     if args.model in DIT_CONFIGS:
         cfg_values = DIT_CONFIGS[args.model]
         return DiTAttractor(
@@ -527,8 +605,22 @@ def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimize
     )
 
 
-def write_summary(path: str, args: argparse.Namespace, train_rows: List[Dict[str, float]], eval_rows: List[Dict[str, float]]) -> None:
-    best = max(eval_rows, key=lambda row: row["model_acc"])
+def load_model_checkpoint(path: str, model: nn.Module, device: torch.device) -> int:
+    checkpoint = torch.load(path, map_location=device)
+    model.load_state_dict(checkpoint["model"])
+    return int(checkpoint.get("epoch", 0))
+
+
+def write_summary(
+    path: str,
+    args: argparse.Namespace,
+    train_rows: List[Dict[str, float]],
+    val_rows: List[Dict[str, float]],
+    test_rows: List[Dict[str, float]],
+    best_epoch: int,
+    best_val_acc: float,
+) -> None:
+    best = max(test_rows, key=lambda row: row["model_acc"])
     params = train_rows[-1]["params_m"] if train_rows else 0.0
     with open(path, "w") as f:
         f.write("# Attraction Field Model Summary\n\n")
@@ -536,48 +628,63 @@ def write_summary(path: str, args: argparse.Namespace, train_rows: List[Dict[str
         f.write(f"- params_m: {params:.4f}\n")
         f.write(f"- train_timestep: {args.train_timestep}\n")
         f.write(f"- epochs: {args.epochs}\n")
+        f.write(f"- best_epoch: {best_epoch}\n")
+        f.write(f"- best_val_acc: {best_val_acc:.6f}\n")
         f.write(f"- train_per_class: {args.train_per_class}\n")
-        f.write(f"- eval_per_class: {args.eval_per_class}\n")
+        f.write(f"- val_per_class: {args.val_per_class}\n")
+        f.write(f"- test_per_class: {args.test_per_class}\n")
         f.write(f"- noise_repeats: {args.noise_repeats}\n\n")
-        f.write("## Best Eval\n\n")
+        f.write("## Best Test Eval\n\n")
         f.write(f"- eval_timestep: {int(best['eval_timestep'])}\n")
         f.write(f"- model_acc: {best['model_acc']:.6f}\n")
         f.write(f"- noisy_acc: {best['noisy_acc']:.6f}\n")
         f.write(f"- clean_acc: {best['clean_acc']:.6f}\n")
         f.write(f"- model_margin: {best['model_margin']:.6f}\n")
         f.write(f"- contraction: {best['contraction']:.6f}\n\n")
-        f.write("## Eval Rows\n\n")
+        f.write("## Test Rows\n\n")
         f.write("| eval_timestep | clean_acc | noisy_acc | model_acc | model_margin | contraction |\n")
         f.write("| ---: | ---: | ---: | ---: | ---: | ---: |\n")
-        for row in eval_rows:
+        for row in test_rows:
             f.write(
                 f"| {int(row['eval_timestep'])} | {row['clean_acc']:.6f} | "
                 f"{row['noisy_acc']:.6f} | {row['model_acc']:.6f} | "
                 f"{row['model_margin']:.6f} | {row['contraction']:.6f} |\n"
             )
+        if val_rows:
+            f.write("\n## Validation Selection\n\n")
+            f.write("| epoch | val_acc | val_margin | val_contraction |\n")
+            f.write("| ---: | ---: | ---: | ---: |\n")
+            for row in val_rows:
+                f.write(
+                    f"| {int(row['epoch'])} | {row['model_acc']:.6f} | "
+                    f"{row['model_margin']:.6f} | {row['contraction']:.6f} |\n"
+                )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare models on noisy prototype attraction field learning.")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./吸引场验证/outputs")
-    parser.add_argument("--model", choices=["linear", "mlp", "cnn", "dit-xs", "dit-s", "dit-b"], default="dit-xs")
+    parser.add_argument("--model", choices=["linear", "mlp", "cnn", "cnn-strong", "dit-xs", "dit-s", "dit-b"], default="dit-xs")
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--train-per-class", type=int, default=0)
-    parser.add_argument("--eval-per-class", type=int, default=0)
+    parser.add_argument("--val-per-class", type=int, default=1000)
+    parser.add_argument("--test-per-class", type=int, default=0)
     parser.add_argument("--train-timestep", type=int, default=200)
     parser.add_argument("--eval-timesteps", default="200")
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--noise-repeats", type=int, default=1)
+    parser.add_argument("--val-noise-repeats", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--mlp-hidden-size", type=int, default=1024)
     parser.add_argument("--cnn-channels", type=int, default=64)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--patience", type=int, default=0, help="0 disables early stopping but still saves best validation checkpoint")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -596,15 +703,23 @@ def main() -> None:
         if timestep < 0 or timestep >= args.diffusion_steps:
             raise ValueError(f"eval timestep {timestep} is outside diffusion range")
 
-    train_loader, eval_loader, prototype_loader = build_loaders(args)
+    train_loader, val_loader, test_loader, prototype_loader = build_loaders(args)
     schedule = DiffusionSchedule(args.diffusion_steps, device)
     prototypes = build_prototypes(prototype_loader, device, args.num_classes)
     model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"device={device} model={args.model} params={params_m:.4f}M train_t={args.train_timestep}")
+    print(
+        f"device={device} model={args.model} params={params_m:.4f}M train_t={args.train_timestep} "
+        f"train_batches={len(train_loader)} val_batches={len(val_loader)} test_batches={len(test_loader)}"
+    )
 
     train_rows: List[Dict[str, float]] = []
+    val_rows: List[Dict[str, float]] = []
+    best_val_acc = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
+    best_path = os.path.join(args.output_dir, "best_checkpoint.pt")
     for epoch in range(1, args.epochs + 1):
         loss = train_one_epoch(
             model,
@@ -619,19 +734,50 @@ def main() -> None:
         row = {"epoch": epoch, "train_loss": loss, "params_m": params_m}
         train_rows.append(row)
         write_csv(os.path.join(args.output_dir, "train_log.csv"), train_rows)
-        print(f"epoch={epoch} train_loss={loss:.6f}")
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            schedule,
+            prototypes,
+            device,
+            args.train_timestep,
+            args.val_noise_repeats,
+        )
+        val_row = {"epoch": epoch}
+        val_row.update(val_metrics)
+        val_rows.append(val_row)
+        write_csv(os.path.join(args.output_dir, "val_metrics.csv"), val_rows)
 
-    eval_rows = [
-        evaluate(model, eval_loader, schedule, prototypes, device, timestep, args.noise_repeats)
+        improved = val_metrics["model_acc"] > best_val_acc
+        if improved:
+            best_val_acc = val_metrics["model_acc"]
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            save_checkpoint(best_path, model, optimizer, epoch, args)
+        else:
+            epochs_without_improvement += 1
+
+        print(
+            f"epoch={epoch} train_loss={loss:.6f} "
+            f"val_acc={val_metrics['model_acc']:.4f} best_val={best_val_acc:.4f}@{best_epoch}"
+        )
+
+        if args.patience > 0 and epochs_without_improvement >= args.patience:
+            print(f"early_stop epoch={epoch} patience={args.patience}")
+            break
+
+    load_model_checkpoint(best_path, model, device)
+    test_rows = [
+        evaluate(model, test_loader, schedule, prototypes, device, timestep, args.noise_repeats)
         for timestep in eval_timesteps
     ]
-    write_csv(os.path.join(args.output_dir, "eval_metrics.csv"), eval_rows)
-    save_checkpoint(os.path.join(args.output_dir, "checkpoint.pt"), model, optimizer, args.epochs, args)
-    write_summary(os.path.join(args.output_dir, "summary.md"), args, train_rows, eval_rows)
-    best = max(eval_rows, key=lambda row: row["model_acc"])
+    write_csv(os.path.join(args.output_dir, "test_metrics.csv"), test_rows)
+    save_checkpoint(os.path.join(args.output_dir, "final_checkpoint.pt"), model, optimizer, best_epoch, args)
+    write_summary(os.path.join(args.output_dir, "summary.md"), args, train_rows, val_rows, test_rows, best_epoch, best_val_acc)
+    best = max(test_rows, key=lambda row: row["model_acc"])
     print(
-        f"wrote={args.output_dir} best_eval_t={int(best['eval_timestep'])} "
-        f"model_acc={best['model_acc']:.4f} contraction={best['contraction']:.4f}"
+        f"wrote={args.output_dir} best_epoch={best_epoch} best_val_acc={best_val_acc:.4f} "
+        f"best_test_t={int(best['eval_timestep'])} test_acc={best['model_acc']:.4f} contraction={best['contraction']:.4f}"
     )
 
 
