@@ -275,6 +275,52 @@ class StrongCNNAttractor(nn.Module):
         return self.out_conv(F.silu(self.out_norm(h))).clamp(-1, 1)
 
 
+class UNetAttractor(nn.Module):
+    def __init__(self, base_channels: int = 64, time_dim: int = 256):
+        super().__init__()
+        self.t_embedder = TimestepEmbedder(time_dim)
+        self.in_conv = nn.Conv2d(1, base_channels, kernel_size=3, padding=1)
+
+        self.enc1a = ResidualConvBlock(base_channels, time_dim)
+        self.enc1b = ResidualConvBlock(base_channels, time_dim)
+        self.down1 = nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1)
+
+        self.enc2a = ResidualConvBlock(base_channels * 2, time_dim)
+        self.enc2b = ResidualConvBlock(base_channels * 2, time_dim)
+        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=4, stride=2, padding=1)
+
+        self.mid1 = ResidualConvBlock(base_channels * 4, time_dim)
+        self.mid2 = ResidualConvBlock(base_channels * 4, time_dim)
+        self.mid3 = ResidualConvBlock(base_channels * 4, time_dim)
+
+        self.up1 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, kernel_size=4, stride=2, padding=1)
+        self.skip1 = nn.Conv2d(base_channels * 4, base_channels * 2, kernel_size=1)
+        self.dec1a = ResidualConvBlock(base_channels * 2, time_dim)
+        self.dec1b = ResidualConvBlock(base_channels * 2, time_dim)
+
+        self.up2 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.skip2 = nn.Conv2d(base_channels * 2, base_channels, kernel_size=1)
+        self.dec2a = ResidualConvBlock(base_channels, time_dim)
+        self.dec2b = ResidualConvBlock(base_channels, time_dim)
+
+        self.out_norm = nn.GroupNorm(8, base_channels)
+        self.out_conv = nn.Conv2d(base_channels, 1, kernel_size=3, padding=1)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        time_embedding = self.t_embedder(t)
+        h1 = self.enc1b(self.enc1a(self.in_conv(x), time_embedding), time_embedding)
+        h2 = self.enc2b(self.enc2a(self.down1(h1), time_embedding), time_embedding)
+        h = self.down2(h2)
+        h = self.mid3(self.mid2(self.mid1(h, time_embedding), time_embedding), time_embedding)
+        h = self.up1(h)
+        h = self.skip1(torch.cat([h, h2], dim=1))
+        h = self.dec1b(self.dec1a(h, time_embedding), time_embedding)
+        h = self.up2(h)
+        h = self.skip2(torch.cat([h, h1], dim=1))
+        h = self.dec2b(self.dec2a(h, time_embedding), time_embedding)
+        return self.out_conv(F.silu(self.out_norm(h))).clamp(-1, 1)
+
+
 class PatchEmbed(nn.Module):
     def __init__(self, image_size: int, patch_size: int, in_channels: int, hidden_size: int):
         super().__init__()
@@ -423,6 +469,8 @@ def build_model(args: argparse.Namespace) -> nn.Module:
         return CNNAttractor(args.cnn_channels)
     if args.model == "cnn-strong":
         return StrongCNNAttractor(args.cnn_channels)
+    if args.model == "unet":
+        return UNetAttractor(args.cnn_channels)
     if args.model in DIT_CONFIGS:
         cfg_values = DIT_CONFIGS[args.model]
         return DiTAttractor(
@@ -468,6 +516,32 @@ def nearest_proto_metrics(outputs: torch.Tensor, labels: torch.Tensor, prototype
     }
 
 
+@torch.no_grad()
+def attraction_inference(
+    model: nn.Module,
+    x_t: torch.Tensor,
+    eval_timestep: int,
+    inference_steps: int,
+    step_size: float,
+    schedule_mode: str,
+) -> torch.Tensor:
+    current = x_t
+    steps = max(inference_steps, 1)
+    for step in range(steps):
+        if schedule_mode == "decreasing" and steps > 1:
+            timestep = round(eval_timestep * (1.0 - step / (steps - 1)))
+        else:
+            timestep = eval_timestep
+        t = torch.full((current.shape[0],), int(timestep), device=current.device, dtype=torch.long)
+        predicted_endpoint = model(current, t)
+        if steps == 1:
+            current = predicted_endpoint
+        else:
+            current = current + step_size * (predicted_endpoint - current)
+            current = current.clamp(-1, 1)
+    return current
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -509,6 +583,9 @@ def evaluate(
     device: torch.device,
     eval_timestep: int,
     noise_repeats: int,
+    inference_steps: int,
+    step_size: float,
+    inference_schedule: str,
 ) -> Dict[str, float]:
     model.eval()
     totals = {
@@ -543,7 +620,14 @@ def evaluate(
         for _ in range(noise_repeats):
             t = torch.full((images.shape[0],), eval_timestep, device=device, dtype=torch.long)
             x_t = schedule.q_sample(images, t, torch.randn_like(images))
-            outputs = model(x_t, t)
+            outputs = attraction_inference(
+                model,
+                x_t,
+                eval_timestep,
+                inference_steps=inference_steps,
+                step_size=step_size,
+                schedule_mode=inference_schedule,
+            )
             noisy_metrics = nearest_proto_metrics(x_t, labels, scaled_prototypes)
             model_metrics = nearest_proto_metrics(outputs, labels, prototypes)
 
@@ -633,7 +717,10 @@ def write_summary(
         f.write(f"- train_per_class: {args.train_per_class}\n")
         f.write(f"- val_per_class: {args.val_per_class}\n")
         f.write(f"- test_per_class: {args.test_per_class}\n")
-        f.write(f"- noise_repeats: {args.noise_repeats}\n\n")
+        f.write(f"- noise_repeats: {args.noise_repeats}\n")
+        f.write(f"- inference_steps: {args.inference_steps}\n")
+        f.write(f"- attraction_step_size: {args.attraction_step_size}\n")
+        f.write(f"- inference_schedule: {args.inference_schedule}\n\n")
         f.write("## Best Test Eval\n\n")
         f.write(f"- eval_timestep: {int(best['eval_timestep'])}\n")
         f.write(f"- model_acc: {best['model_acc']:.6f}\n")
@@ -665,7 +752,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare models on noisy prototype attraction field learning.")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./吸引场验证/outputs")
-    parser.add_argument("--model", choices=["linear", "mlp", "cnn", "cnn-strong", "dit-xs", "dit-s", "dit-b"], default="dit-xs")
+    parser.add_argument("--model", choices=["linear", "mlp", "cnn", "cnn-strong", "unet", "dit-xs", "dit-s", "dit-b"], default="dit-xs")
     parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -678,6 +765,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--noise-repeats", type=int, default=1)
     parser.add_argument("--val-noise-repeats", type=int, default=1)
+    parser.add_argument("--inference-steps", type=int, default=1)
+    parser.add_argument("--attraction-step-size", type=float, default=1.0)
+    parser.add_argument("--inference-schedule", choices=["constant", "decreasing"], default="constant")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -742,6 +832,9 @@ def main() -> None:
             device,
             args.train_timestep,
             args.val_noise_repeats,
+            args.inference_steps,
+            args.attraction_step_size,
+            args.inference_schedule,
         )
         val_row = {"epoch": epoch}
         val_row.update(val_metrics)
@@ -768,7 +861,18 @@ def main() -> None:
 
     load_model_checkpoint(best_path, model, device)
     test_rows = [
-        evaluate(model, test_loader, schedule, prototypes, device, timestep, args.noise_repeats)
+        evaluate(
+            model,
+            test_loader,
+            schedule,
+            prototypes,
+            device,
+            timestep,
+            args.noise_repeats,
+            args.inference_steps,
+            args.attraction_step_size,
+            args.inference_schedule,
+        )
         for timestep in eval_timesteps
     ]
     write_csv(os.path.join(args.output_dir, "test_metrics.csv"), test_rows)
