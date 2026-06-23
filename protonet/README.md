@@ -82,6 +82,72 @@ python protonet/noisy_protonet.py \
   --weight-decay 1e-4
 ```
 
+Recommended miniImageNet run:
+
+Option A: Hugging Face dataset, no manual conversion:
+
+```bash
+python protonet/noisy_protonet.py \
+  --device cuda \
+  --dataset miniimagenet-hf \
+  --hf-dataset-id GATE-engine/mini_imagenet \
+  --data-dir ./data \
+  --eval-split test \
+  --image-size 84 \
+  --output-dir ./protonet/outputs/noisy_protonet_miniimagenet_hf_5way5shot \
+  --train-noise-timesteps 0,100,200,250,300,400,500 \
+  --train-noise-target both \
+  --eval-noise-target both \
+  --way 5 \
+  --shot 5 \
+  --query 15 \
+  --train-episodes 10000 \
+  --eval-episodes 600 \
+  --eval-interval 1000 \
+  --hidden-channels 64 \
+  --embedding-dim 64 \
+  --lr 1e-3 \
+  --weight-decay 1e-4
+```
+
+Option B: local ImageFolder layout:
+
+```txt
+data/miniImageNet/
+  train/
+    class_001/*.jpg
+    class_002/*.jpg
+  val/
+    class_064/*.jpg
+  test/
+    class_084/*.jpg
+```
+
+Then run:
+
+```bash
+python protonet/noisy_protonet.py \
+  --device cuda \
+  --dataset miniimagenet \
+  --data-dir ./data \
+  --eval-split test \
+  --image-size 84 \
+  --output-dir ./protonet/outputs/noisy_protonet_miniimagenet_5way5shot \
+  --train-noise-timesteps 0,100,200,250,300,400,500 \
+  --train-noise-target both \
+  --eval-noise-target both \
+  --way 5 \
+  --shot 5 \
+  --query 15 \
+  --train-episodes 10000 \
+  --eval-episodes 600 \
+  --eval-interval 1000 \
+  --hidden-channels 64 \
+  --embedding-dim 64 \
+  --lr 1e-3 \
+  --weight-decay 1e-4
+```
+
 Key outputs:
 
 - `train_eval_log.csv`

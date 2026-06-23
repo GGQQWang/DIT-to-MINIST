@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from PIL import Image
 
 
 def parse_int_list(value: str) -> Tuple[int, ...]:
@@ -109,6 +110,30 @@ class IndexedDataset:
             torch.stack(query_images).to(device),
             torch.tensor(query_labels, device=device, dtype=torch.long),
         )
+
+
+class HFMiniImageNetDataset:
+    def __init__(self, hf_split, transform):
+        self.hf_split = hf_split
+        self.transform = transform
+        raw_labels = [int(label) for label in hf_split["label"]]
+        unique_labels = sorted(set(raw_labels))
+        self.label_to_contiguous = {label: idx for idx, label in enumerate(unique_labels)}
+        self.targets = [self.label_to_contiguous[label] for label in raw_labels]
+        self.classes = [str(label) for label in unique_labels]
+
+    def __len__(self) -> int:
+        return len(self.hf_split)
+
+    def __getitem__(self, idx: int):
+        item = self.hf_split[idx]
+        image = item["image"]
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(image)
+        image = image.convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, self.targets[idx]
 
 
 class ConvBlock(nn.Module):
@@ -248,6 +273,63 @@ def build_dataset(args: argparse.Namespace, train: bool):
         dataset = datasets.Omniglot(args.data_dir, background=background, download=True, transform=transform)
         return dataset, 1, len(dataset._characters)
 
+    if args.dataset == "miniimagenet":
+        transform = transforms.Compose(
+            [
+                transforms.Resize((args.image_size, args.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        split = "train" if train else args.eval_split
+        root_candidates = [
+            os.path.join(args.data_dir, "miniImageNet", split),
+            os.path.join(args.data_dir, "miniimagenet", split),
+            os.path.join(args.data_dir, split),
+        ]
+        split_root = next((path for path in root_candidates if os.path.isdir(path)), None)
+        if split_root is None:
+            candidates = "\n".join(f"  - {path}" for path in root_candidates)
+            raise FileNotFoundError(
+                "miniImageNet split directory was not found. Expected one of:\n"
+                f"{candidates}\n"
+                "Use ImageFolder layout: split/class_name/image.jpg"
+            )
+        print(f"loading dataset=miniimagenet split={split} root={split_root}", flush=True)
+        dataset = datasets.ImageFolder(split_root, transform=transform)
+        print(
+            f"loaded dataset=miniimagenet split={split} samples={len(dataset)} "
+            f"classes={len(dataset.classes)}",
+            flush=True,
+        )
+        return dataset, 3, len(dataset.classes)
+
+    if args.dataset == "miniimagenet-hf":
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            raise ImportError("Install Hugging Face datasets first: pip install datasets") from exc
+
+        transform = transforms.Compose(
+            [
+                transforms.Resize((args.image_size, args.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        split = "train" if train else args.eval_split
+        if split == "val":
+            split = "validation"
+        print(f"loading dataset=miniimagenet-hf id={args.hf_dataset_id} split={split}", flush=True)
+        hf_split = load_dataset(args.hf_dataset_id, split=split)
+        dataset = HFMiniImageNetDataset(hf_split, transform)
+        print(
+            f"loaded dataset=miniimagenet-hf split={split} samples={len(dataset)} "
+            f"classes={len(dataset.classes)}",
+            flush=True,
+        )
+        return dataset, 3, len(dataset.classes)
+
     raise ValueError(f"unsupported dataset: {args.dataset}")
 
 
@@ -381,7 +463,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ProtoNet baseline with DDPM forward-noise training.")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./protonet/outputs/noisy_protonet")
-    parser.add_argument("--dataset", choices=["mnist", "fashion-mnist", "omniglot"], default="fashion-mnist")
+    parser.add_argument(
+        "--dataset",
+        choices=["mnist", "fashion-mnist", "omniglot", "miniimagenet", "miniimagenet-hf"],
+        default="fashion-mnist",
+    )
+    parser.add_argument("--hf-dataset-id", default="GATE-engine/mini_imagenet")
+    parser.add_argument("--eval-split", choices=["val", "test"], default="test", help="Evaluation split for ImageFolder datasets.")
+    parser.add_argument("--image-size", type=int, default=84, help="Image size for miniImageNet.")
     parser.add_argument("--train-noise-timesteps", default="0,100,200,250,300,400,500")
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--train-noise-target", choices=["none", "support", "query", "both"], default="both")

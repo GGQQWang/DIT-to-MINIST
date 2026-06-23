@@ -4,3 +4,6 @@
 torch>=2.5
 torchvision>=0.20
 numpy>=1.24
+transformers>=4.41
+pillow>=10.0
+datasets>=2.19
