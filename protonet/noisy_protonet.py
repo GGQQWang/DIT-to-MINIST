@@ -171,6 +171,16 @@ def squared_euclidean(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return (x[:, None, :] - y[None]).pow(2).sum(dim=2)
 
 
+def normalize_features(z: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "none":
+        return z
+    if mode == "layernorm":
+        return F.layer_norm(z, z.shape[1:])
+    if mode == "l2":
+        return F.normalize(z, dim=1)
+    raise ValueError(f"unsupported feature normalization: {mode}")
+
+
 def build_prototypes(embeddings: torch.Tensor, labels: torch.Tensor, way: int) -> torch.Tensor:
     prototypes = []
     for cls in range(way):
@@ -201,6 +211,66 @@ def apply_training_noise(
     return support_x.clamp(-1, 1), query_x.clamp(-1, 1)
 
 
+def apply_feature_noise(
+    query_z: torch.Tensor,
+    prototypes: torch.Tensor,
+    schedule: DiffusionSchedule,
+    noise_timestep: int,
+    noise_target: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if noise_timestep == 0 or noise_target == "none":
+        return query_z, prototypes
+    if noise_target != "query":
+        raise ValueError("feature-space DDPM currently supports --*-noise-target query or none only")
+
+    t = torch.full((query_z.shape[0],), noise_timestep, device=query_z.device, dtype=torch.long)
+    query_z_t = schedule.q_sample(query_z, t, torch.randn_like(query_z))
+    prototypes_t = schedule.sqrt_alpha_bars[noise_timestep] * prototypes
+    return query_z_t, prototypes_t
+
+
+def distance_geometry_loss(
+    distances: torch.Tensor,
+    query_y: torch.Tensor,
+    prototypes: torch.Tensor,
+    margin: float,
+    proto_sep_margin: float,
+    lambda_margin: float,
+    lambda_proto_sep: float,
+    lambda_var: float,
+    clean_embeddings: torch.Tensor,
+    var_gamma: float,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    true_dist = distances[torch.arange(query_y.numel(), device=query_y.device), query_y]
+    wrong = distances.clone()
+    wrong[torch.arange(query_y.numel(), device=query_y.device), query_y] = float("inf")
+    nearest_wrong = wrong.min(dim=1).values
+
+    positive_loss = true_dist.mean()
+    margin_loss = F.relu(margin + true_dist - nearest_wrong).mean()
+
+    proto_pair_dist = squared_euclidean(prototypes, prototypes)
+    pair_mask = torch.triu(torch.ones_like(proto_pair_dist, dtype=torch.bool), diagonal=1)
+    proto_sep_loss = F.relu(proto_sep_margin - proto_pair_dist[pair_mask]).mean()
+
+    feature_std = clean_embeddings.std(dim=0, unbiased=False)
+    variance_loss = F.relu(var_gamma - feature_std).mean()
+
+    loss = (
+        positive_loss
+        + lambda_margin * margin_loss
+        + lambda_proto_sep * proto_sep_loss
+        + lambda_var * variance_loss
+    )
+    parts = {
+        "positive_loss": float(positive_loss.item()),
+        "contrast_loss": float(margin_loss.item()),
+        "proto_sep_loss": float(proto_sep_loss.item()),
+        "variance_loss": float(variance_loss.item()),
+    }
+    return loss, parts
+
+
 def protonet_episode(
     encoder: nn.Module,
     support_x: torch.Tensor,
@@ -208,18 +278,55 @@ def protonet_episode(
     query_x: torch.Tensor,
     query_y: torch.Tensor,
     way: int,
-    normalize_embeddings: bool,
+    args: argparse.Namespace,
+    schedule: DiffusionSchedule,
+    noise_timestep: int,
+    noise_target: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    support_z = encoder(support_x)
-    query_z = encoder(query_x)
-    if normalize_embeddings:
+    if args.noise_space == "image":
+        support_x, query_x = apply_training_noise(support_x, query_x, schedule, noise_timestep, noise_target)
+
+    support_z = normalize_features(encoder(support_x), args.feature_normalization)
+    query_z = normalize_features(encoder(query_x), args.feature_normalization)
+    if args.normalize_embeddings:
         support_z = F.normalize(support_z, dim=1)
         query_z = F.normalize(query_z, dim=1)
     prototypes = build_prototypes(support_z, support_y, way)
-    distances = squared_euclidean(query_z, prototypes)
-    logits = -distances
-    loss = F.cross_entropy(logits, query_y)
-    preds = logits.argmax(dim=1)
+
+    clean_embeddings = torch.cat([support_z, query_z], dim=0)
+    if args.noise_space == "feature":
+        query_z, prototypes_for_query = apply_feature_noise(query_z, prototypes, schedule, noise_timestep, noise_target)
+    else:
+        prototypes_for_query = prototypes
+
+    distances = squared_euclidean(query_z, prototypes_for_query)
+
+    if args.loss_type == "ce":
+        logits = -distances
+        loss = F.cross_entropy(logits, query_y)
+        loss_parts = {
+            "positive_loss": 0.0,
+            "contrast_loss": 0.0,
+            "proto_sep_loss": 0.0,
+            "variance_loss": 0.0,
+        }
+    elif args.loss_type == "distance":
+        loss, loss_parts = distance_geometry_loss(
+            distances=distances,
+            query_y=query_y,
+            prototypes=prototypes,
+            margin=args.distance_margin,
+            proto_sep_margin=args.proto_sep_margin,
+            lambda_margin=args.lambda_margin,
+            lambda_proto_sep=args.lambda_proto_sep,
+            lambda_var=args.lambda_var,
+            clean_embeddings=clean_embeddings,
+            var_gamma=args.var_gamma,
+        )
+    else:
+        raise ValueError(f"unsupported loss type: {args.loss_type}")
+
+    preds = distances.argmin(dim=1)
     true_dist = distances[torch.arange(query_y.numel(), device=query_y.device), query_y]
     wrong = distances.clone()
     wrong[torch.arange(query_y.numel(), device=query_y.device), query_y] = float("inf")
@@ -230,6 +337,7 @@ def protonet_episode(
         "true_distance": float(true_dist.mean().item()),
         "nearest_wrong_distance": float(nearest_wrong.mean().item()),
     }
+    metrics.update(loss_parts)
     return loss, metrics
 
 
@@ -354,13 +462,6 @@ def evaluate(
                 device,
                 rng,
             )
-            support_x, query_x = apply_training_noise(
-                support_x,
-                query_x,
-                schedule,
-                eval_noise_timestep,
-                args.eval_noise_target,
-            )
             _, metrics = protonet_episode(
                 encoder,
                 support_x,
@@ -368,7 +469,10 @@ def evaluate(
                 query_x,
                 query_y,
                 args.way,
-                args.normalize_embeddings,
+                args,
+                schedule,
+                eval_noise_timestep,
+                args.eval_noise_target,
             )
             rows.append(metrics)
     return mean_metrics(rows)
@@ -401,13 +505,6 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             device,
             train_rng,
         )
-        support_x, query_x = apply_training_noise(
-            support_x,
-            query_x,
-            schedule,
-            train_noise_timestep,
-            args.train_noise_target,
-        )
         loss, train_metrics = protonet_episode(
             encoder,
             support_x,
@@ -415,7 +512,10 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             query_x,
             query_y,
             args.way,
-            args.normalize_embeddings,
+            args,
+            schedule,
+            train_noise_timestep,
+            args.train_noise_target,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -449,6 +549,10 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 "eval_clean_margin": eval_clean["margin"],
                 "eval_same_noise_acc": eval_same["acc"],
                 "eval_same_noise_margin": eval_same["margin"],
+                "positive_loss": train_metrics["positive_loss"],
+                "contrast_loss": train_metrics["contrast_loss"],
+                "proto_sep_loss": train_metrics["proto_sep_loss"],
+                "variance_loss": train_metrics["variance_loss"],
             }
             rows.append(row)
             print(
@@ -460,7 +564,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ProtoNet baseline with DDPM forward-noise training.")
+    parser = argparse.ArgumentParser(description="ProtoNet with feature-space DDPM noise and geometric distance loss.")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./protonet/outputs/noisy_protonet")
     parser.add_argument(
@@ -473,8 +577,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=84, help="Image size for miniImageNet.")
     parser.add_argument("--train-noise-timesteps", default="0,100,200,250,300,400,500")
     parser.add_argument("--diffusion-steps", type=int, default=1000)
-    parser.add_argument("--train-noise-target", choices=["none", "support", "query", "both"], default="both")
-    parser.add_argument("--eval-noise-target", choices=["none", "support", "query", "both"], default="both")
+    parser.add_argument("--noise-space", choices=["feature", "image"], default="feature")
+    parser.add_argument("--train-noise-target", choices=["none", "support", "query", "both"], default="query")
+    parser.add_argument("--eval-noise-target", choices=["none", "support", "query", "both"], default="query")
+    parser.add_argument("--loss-type", choices=["distance", "ce"], default="distance")
+    parser.add_argument("--feature-normalization", choices=["none", "layernorm", "l2"], default="layernorm")
+    parser.add_argument("--distance-margin", type=float, default=1.0)
+    parser.add_argument("--lambda-margin", type=float, default=1.0)
+    parser.add_argument("--proto-sep-margin", type=float, default=1.0)
+    parser.add_argument("--lambda-proto-sep", type=float, default=0.1)
+    parser.add_argument("--lambda-var", type=float, default=0.0)
+    parser.add_argument("--var-gamma", type=float, default=1.0)
     parser.add_argument("--way", type=int, default=5)
     parser.add_argument("--shot", type=int, default=5)
     parser.add_argument("--query", type=int, default=15)

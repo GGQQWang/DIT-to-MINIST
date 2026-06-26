@@ -34,7 +34,15 @@ Key outputs:
 
 ## 2. Noisy ProtoNet
 
-Purpose: test whether moderate DDPM forward noise during episodic ProtoNet training improves prototype-based few-shot learning.
+Purpose: test whether moderate DDPM forward noise in embedding space improves prototype-based few-shot learning.
+
+Default method:
+
+- support images are encoded cleanly;
+- support embeddings form clean prototypes;
+- query embeddings receive DDPM forward noise;
+- prototypes are synchronously scaled by `sqrt(alpha_bar_t)`;
+- training uses a geometric distance loss with margin contrast and prototype separation.
 
 Recommended Fashion-MNIST run:
 
@@ -45,8 +53,11 @@ python protonet/noisy_protonet.py \
   --data-dir ./data \
   --output-dir ./protonet/outputs/noisy_protonet_fashion_mnist \
   --train-noise-timesteps 0,100,200,250,300,400,500 \
-  --train-noise-target both \
-  --eval-noise-target both \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type distance \
+  --feature-normalization layernorm \
   --way 5 \
   --shot 5 \
   --query 15 \
@@ -68,8 +79,11 @@ python protonet/noisy_protonet.py \
   --data-dir ./data \
   --output-dir ./protonet/outputs/noisy_protonet_omniglot \
   --train-noise-timesteps 0,100,200,250,300,400,500 \
-  --train-noise-target both \
-  --eval-noise-target both \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type distance \
+  --feature-normalization layernorm \
   --way 5 \
   --shot 5 \
   --query 15 \
@@ -96,8 +110,11 @@ python protonet/noisy_protonet.py \
   --image-size 84 \
   --output-dir ./protonet/outputs/noisy_protonet_miniimagenet_hf_5way5shot \
   --train-noise-timesteps 0,100,200,250,300,400,500 \
-  --train-noise-target both \
-  --eval-noise-target both \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type distance \
+  --feature-normalization layernorm \
   --way 5 \
   --shot 5 \
   --query 15 \
@@ -134,8 +151,11 @@ python protonet/noisy_protonet.py \
   --image-size 84 \
   --output-dir ./protonet/outputs/noisy_protonet_miniimagenet_5way5shot \
   --train-noise-timesteps 0,100,200,250,300,400,500 \
-  --train-noise-target both \
-  --eval-noise-target both \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type distance \
+  --feature-normalization layernorm \
   --way 5 \
   --shot 5 \
   --query 15 \
@@ -154,3 +174,13 @@ Key outputs:
 - `final_results.csv`
 
 The default ProtoNet uses squared Euclidean distance without embedding normalization.
+
+To reproduce the older image-noise ProtoNet baseline, add:
+
+```bash
+--noise-space image \
+--loss-type ce \
+--feature-normalization none \
+--train-noise-target both \
+--eval-noise-target both
+```
