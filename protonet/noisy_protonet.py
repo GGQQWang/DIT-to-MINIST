@@ -167,8 +167,13 @@ class Conv4Encoder(nn.Module):
         return self.proj(h)
 
 
-def squared_euclidean(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return (x[:, None, :] - y[None]).pow(2).sum(dim=2)
+def pairwise_squared_distance(x: torch.Tensor, y: torch.Tensor, reduction: str) -> torch.Tensor:
+    distances = (x[:, None, :] - y[None]).pow(2)
+    if reduction == "sum":
+        return distances.sum(dim=2)
+    if reduction == "mean":
+        return distances.mean(dim=2)
+    raise ValueError(f"unsupported distance reduction: {reduction}")
 
 
 def normalize_features(z: torch.Tensor, mode: str) -> torch.Tensor:
@@ -236,10 +241,13 @@ def distance_geometry_loss(
     margin: float,
     proto_sep_margin: float,
     lambda_margin: float,
+    lambda_positive: float,
     lambda_proto_sep: float,
     lambda_var: float,
     clean_embeddings: torch.Tensor,
     var_gamma: float,
+    contrast_temperature: float,
+    distance_reduction: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     true_dist = distances[torch.arange(query_y.numel(), device=query_y.device), query_y]
     wrong = distances.clone()
@@ -247,17 +255,22 @@ def distance_geometry_loss(
     nearest_wrong = wrong.min(dim=1).values
 
     positive_loss = true_dist.mean()
-    margin_loss = F.relu(margin + true_dist - nearest_wrong).mean()
+    negative_distances = distances.masked_fill(
+        F.one_hot(query_y, num_classes=distances.shape[1]).bool(),
+        float("inf"),
+    )
+    contrast_logits = (margin + true_dist[:, None] - negative_distances) / contrast_temperature
+    margin_loss = F.softplus(contrast_logits[torch.isfinite(contrast_logits)]).mean()
 
-    proto_pair_dist = squared_euclidean(prototypes, prototypes)
+    proto_pair_dist = pairwise_squared_distance(prototypes, prototypes, distance_reduction)
     pair_mask = torch.triu(torch.ones_like(proto_pair_dist, dtype=torch.bool), diagonal=1)
-    proto_sep_loss = F.relu(proto_sep_margin - proto_pair_dist[pair_mask]).mean()
+    proto_sep_loss = F.softplus((proto_sep_margin - proto_pair_dist[pair_mask]) / contrast_temperature).mean()
 
     feature_std = clean_embeddings.std(dim=0, unbiased=False)
     variance_loss = F.relu(var_gamma - feature_std).mean()
 
     loss = (
-        positive_loss
+        lambda_positive * positive_loss
         + lambda_margin * margin_loss
         + lambda_proto_sep * proto_sep_loss
         + lambda_var * variance_loss
@@ -299,7 +312,7 @@ def protonet_episode(
     else:
         prototypes_for_query = prototypes
 
-    distances = squared_euclidean(query_z, prototypes_for_query)
+    distances = pairwise_squared_distance(query_z, prototypes_for_query, args.distance_reduction)
 
     if args.loss_type == "ce":
         logits = -distances
@@ -318,10 +331,13 @@ def protonet_episode(
             margin=args.distance_margin,
             proto_sep_margin=args.proto_sep_margin,
             lambda_margin=args.lambda_margin,
+            lambda_positive=args.lambda_positive,
             lambda_proto_sep=args.lambda_proto_sep,
             lambda_var=args.lambda_var,
             clean_embeddings=clean_embeddings,
             var_gamma=args.var_gamma,
+            contrast_temperature=args.contrast_temperature,
+            distance_reduction=args.distance_reduction,
         )
     else:
         raise ValueError(f"unsupported loss type: {args.loss_type}")
@@ -582,12 +598,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-noise-target", choices=["none", "support", "query", "both"], default="query")
     parser.add_argument("--loss-type", choices=["distance", "ce"], default="distance")
     parser.add_argument("--feature-normalization", choices=["none", "layernorm", "l2"], default="layernorm")
+    parser.add_argument("--distance-reduction", choices=["mean", "sum"], default="mean")
     parser.add_argument("--distance-margin", type=float, default=1.0)
     parser.add_argument("--lambda-margin", type=float, default=1.0)
+    parser.add_argument("--lambda-positive", type=float, default=0.0)
     parser.add_argument("--proto-sep-margin", type=float, default=1.0)
     parser.add_argument("--lambda-proto-sep", type=float, default=0.1)
     parser.add_argument("--lambda-var", type=float, default=0.0)
     parser.add_argument("--var-gamma", type=float, default=1.0)
+    parser.add_argument("--contrast-temperature", type=float, default=0.2)
     parser.add_argument("--way", type=int, default=5)
     parser.add_argument("--shot", type=int, default=5)
     parser.add_argument("--query", type=int, default=15)
@@ -598,7 +617,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--normalize-embeddings", action="store_true")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
