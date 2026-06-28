@@ -12,8 +12,15 @@ from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 
+# MNIST 多模型原型吸引场实验。
+# 该版本不预测噪声，也不使用扩散反推公式；
+# 模型直接学习一步映射：x_t -> prototype_y。
+# 用它可以比较 Linear、MLP、CNN、UNet、DiT 等结构是否能学会原型收缩场。
+
+
 @dataclass
 class DiTConfig:
+    """DiT 吸引场模型配置。"""
     image_size: int = 28
     patch_size: int = 4
     in_channels: int = 1
@@ -32,6 +39,7 @@ DIT_CONFIGS: Dict[str, Dict[str, int]] = {
 
 
 def parse_int_list(value: str) -> Tuple[int, ...]:
+    """解析逗号分隔的时间步列表。"""
     values = tuple(int(item.strip()) for item in value.split(",") if item.strip())
     if not values:
         raise ValueError("integer list cannot be empty")
@@ -39,6 +47,7 @@ def parse_int_list(value: str) -> Tuple[int, ...]:
 
 
 def resolve_device(name: str) -> torch.device:
+    """根据参数选择 CPU、CUDA 或 MPS。"""
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -49,10 +58,12 @@ def resolve_device(name: str) -> torch.device:
 
 
 def ensure_dir(path: str) -> None:
+    """确保输出目录存在。"""
     os.makedirs(path, exist_ok=True)
 
 
 def balanced_subset_indices_from_pool(pool: Sequence[int], labels: torch.Tensor, per_class: int, num_classes: int, seed: int) -> List[int]:
+    """从给定索引池中按类别均衡采样。"""
     generator = torch.Generator().manual_seed(seed)
     pool_tensor = torch.as_tensor(list(pool), dtype=torch.long)
     indices: List[int] = []
@@ -65,6 +76,7 @@ def balanced_subset_indices_from_pool(pool: Sequence[int], labels: torch.Tensor,
 
 
 def split_train_val_indices(dataset, args: argparse.Namespace) -> Tuple[List[int], List[int]]:
+    """将 MNIST 训练集划分为训练子集和验证子集。"""
     labels = torch.as_tensor(dataset.targets)
     generator = torch.Generator().manual_seed(args.seed)
     train_indices: List[int] = []
@@ -85,6 +97,7 @@ def split_train_val_indices(dataset, args: argparse.Namespace) -> Tuple[List[int
 
 
 def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, DataLoader, DataLoader]:
+    """构建训练、验证、测试和原型统计用 DataLoader。"""
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -133,6 +146,7 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader, Dat
 
 
 class DiffusionSchedule:
+    """前向扩散加噪日程，只用于生成带噪输入 x_t。"""
     def __init__(self, timesteps: int, device: torch.device):
         betas = torch.linspace(1e-4, 0.02, timesteps, device=device)
         alphas = 1.0 - betas
@@ -142,16 +156,19 @@ class DiffusionSchedule:
         self.sqrt_one_minus_alpha_bars = torch.sqrt(1.0 - alpha_bars)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """把原图 x0 按时间步 t 加噪成 x_t。"""
         shape = (t.shape[0],) + (1,) * (x0.dim() - 1)
         sqrt_ab = self.sqrt_alpha_bars[t].view(shape)
         sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(shape)
         return sqrt_ab * x0 + sqrt_omab * noise
 
     def scaled_centers(self, centers: torch.Tensor, timestep: int) -> torch.Tensor:
+        """得到同一时间步下缩放后的原型，用于 noisy baseline。"""
         return self.sqrt_alpha_bars[timestep] * centers
 
 
 class TimestepEmbedder(nn.Module):
+    """将扩散时间步编码成模型可用的条件向量。"""
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
@@ -178,6 +195,7 @@ class TimestepEmbedder(nn.Module):
 
 
 class LinearAttractor(nn.Module):
+    """线性吸引器：验证 x_t 到原型的映射是否近似线性。"""
     def __init__(self):
         super().__init__()
         self.net = nn.Linear(28 * 28, 28 * 28)
@@ -188,6 +206,7 @@ class LinearAttractor(nn.Module):
 
 
 class MLPAttractor(nn.Module):
+    """MLP 吸引器：验证普通非线性全连接网络是否能学习原型收缩。"""
     def __init__(self, hidden_size: int = 1024):
         super().__init__()
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -207,6 +226,7 @@ class MLPAttractor(nn.Module):
 
 
 class CNNAttractor(nn.Module):
+    """小型 CNN 吸引器：利用局部卷积结构直接预测原型化图像。"""
     def __init__(self, hidden_channels: int = 64, time_dim: int = 128):
         super().__init__()
         self.t_embedder = TimestepEmbedder(time_dim)
@@ -231,6 +251,7 @@ class CNNAttractor(nn.Module):
 
 
 class ResidualConvBlock(nn.Module):
+    """带时间条件的残差卷积块。"""
     def __init__(self, channels: int, time_dim: int):
         super().__init__()
         self.norm1 = nn.GroupNorm(8, channels)
@@ -247,6 +268,7 @@ class ResidualConvBlock(nn.Module):
 
 
 class StrongCNNAttractor(nn.Module):
+    """更强 CNN 吸引器：包含下采样、上采样和残差块。"""
     def __init__(self, base_channels: int = 64, time_dim: int = 256):
         super().__init__()
         self.t_embedder = TimestepEmbedder(time_dim)
@@ -276,6 +298,7 @@ class StrongCNNAttractor(nn.Module):
 
 
 class UNetAttractor(nn.Module):
+    """UNet 吸引器：使用编码器-解码器和跳连预测原型化图像。"""
     def __init__(self, base_channels: int = 64, time_dim: int = 256):
         super().__init__()
         self.t_embedder = TimestepEmbedder(time_dim)
@@ -322,6 +345,7 @@ class UNetAttractor(nn.Module):
 
 
 class PatchEmbed(nn.Module):
+    """DiT 使用的 patch embedding。"""
     def __init__(self, image_size: int, patch_size: int, in_channels: int, hidden_size: int):
         super().__init__()
         if image_size % patch_size != 0:
@@ -338,10 +362,12 @@ class PatchEmbed(nn.Module):
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN 调制函数。"""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class DiTBlock(nn.Module):
+    """DiT Transformer 块，使用时间条件调制 attention 和 MLP。"""
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -367,6 +393,7 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
+    """DiT 输出层：把 token 映射回 patch 像素。"""
     def __init__(self, hidden_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -379,6 +406,7 @@ class FinalLayer(nn.Module):
 
 
 class DiTAttractor(nn.Module):
+    """DiT 吸引器：直接输出原型化图像，而不是预测噪声。"""
     def __init__(self, cfg: DiTConfig):
         super().__init__()
         self.cfg = cfg
@@ -393,6 +421,7 @@ class DiTAttractor(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
+        """初始化 DiT 权重，最后层置零提高训练初期稳定性。"""
         def init_linear(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -412,6 +441,7 @@ class DiTAttractor(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """将 patch 输出拼回图像。"""
         batch_size = x.shape[0]
         patch_size = self.cfg.patch_size
         channels = self.cfg.in_channels
@@ -421,6 +451,7 @@ class DiTAttractor(nn.Module):
         return x.reshape(batch_size, channels, grid_size * patch_size, grid_size * patch_size)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """一步前向：输入 x_t 和 t，直接输出原型化图像 z。"""
         c = self.t_embedder(t)
         h = self.patch_embed(x) + self.pos_embed
         for block in self.blocks:
@@ -429,6 +460,7 @@ class DiTAttractor(nn.Module):
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+    """生成二维正弦余弦位置编码。"""
     grid_h = torch.arange(grid_size, dtype=torch.float32)
     grid_w = torch.arange(grid_size, dtype=torch.float32)
     grid = torch.meshgrid(grid_w, grid_h, indexing="ij")
@@ -461,6 +493,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos) -> "numpy.ndarray":
 
 
 def build_model(args: argparse.Namespace) -> nn.Module:
+    """根据 --model 构建对应的吸引场模型。"""
     if args.model == "linear":
         return LinearAttractor()
     if args.model == "mlp":
@@ -486,6 +519,7 @@ def build_model(args: argparse.Namespace) -> nn.Module:
 
 @torch.no_grad()
 def build_prototypes(loader: DataLoader, device: torch.device, num_classes: int) -> torch.Tensor:
+    """用训练集统计每个类别的平均图像原型。"""
     sums = torch.zeros(num_classes, 1, 28, 28, device=device)
     counts = torch.zeros(num_classes, device=device)
     for images, labels in loader:
@@ -500,6 +534,7 @@ def build_prototypes(loader: DataLoader, device: torch.device, num_classes: int)
 
 
 def nearest_proto_metrics(outputs: torch.Tensor, labels: torch.Tensor, prototypes: torch.Tensor) -> Dict[str, float]:
+    """计算最近原型准确率、正确原型距离、最近错误原型距离和 margin。"""
     residuals = (outputs[:, None] - prototypes[None]).pow(2).mean(dim=(2, 3, 4))
     preds = residuals.argmin(dim=1)
     true_residual = residuals[torch.arange(labels.shape[0], device=labels.device), labels]
@@ -525,6 +560,11 @@ def attraction_inference(
     step_size: float,
     schedule_mode: str,
 ) -> torch.Tensor:
+    """吸引场推理。
+
+    默认 inference_steps=1，即一步直接预测 model(x_t, t)。
+    当 inference_steps>1 时，才会把模型输出作为吸引端点做迭代靠近。
+    """
     current = x_t
     steps = max(inference_steps, 1)
     for step in range(steps):
@@ -552,6 +592,7 @@ def train_one_epoch(
     train_timestep: int,
     grad_clip: float,
 ) -> float:
+    """训练一个 epoch：直接学习 x_t -> prototype_y。"""
     model.train()
     total_loss = 0.0
     total_count = 0
@@ -561,6 +602,7 @@ def train_one_epoch(
         t = torch.full((images.shape[0],), train_timestep, device=device, dtype=torch.long)
         x_t = schedule.q_sample(images, t, torch.randn_like(images))
         outputs = model(x_t, t)
+        # 关键损失：输出图像直接向真实类别平均原型收缩。
         loss = F.mse_loss(outputs, prototypes[labels])
 
         optimizer.zero_grad(set_to_none=True)
@@ -587,6 +629,7 @@ def evaluate(
     step_size: float,
     inference_schedule: str,
 ) -> Dict[str, float]:
+    """评估 clean/noisy/model 三种空间的最近原型分类效果。"""
     model.eval()
     totals = {
         "model_correct": 0,
@@ -620,6 +663,7 @@ def evaluate(
         for _ in range(noise_repeats):
             t = torch.full((images.shape[0],), eval_timestep, device=device, dtype=torch.long)
             x_t = schedule.q_sample(images, t, torch.randn_like(images))
+            # 默认一步得到原型化输出；不是预测噪声，也不是扩散多步采样。
             outputs = attraction_inference(
                 model,
                 x_t,
@@ -642,6 +686,7 @@ def evaluate(
 
             numerator = (outputs - prototypes[labels]).flatten(start_dim=1).norm(dim=1)
             denominator = (x_t - scaled_prototypes[labels]).flatten(start_dim=1).norm(dim=1).clamp_min(1e-8)
+            # 收缩比例小于 1 表示模型把样本拉近了正确类别原型。
             totals["contraction_sum"] += float((numerator / denominator).sum().item())
             totals["contraction_count"] += labels.numel()
 
@@ -666,6 +711,7 @@ def evaluate(
 
 
 def write_csv(path: str, rows: Iterable[Dict[str, float]]) -> None:
+    """保存训练、验证或测试指标。"""
     rows = list(rows)
     if not rows:
         return
@@ -677,6 +723,7 @@ def write_csv(path: str, rows: Iterable[Dict[str, float]]) -> None:
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimizer, epoch: int, args: argparse.Namespace) -> None:
+    """保存模型 checkpoint。"""
     ensure_dir(os.path.dirname(path) or ".")
     torch.save(
         {
@@ -690,6 +737,7 @@ def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimize
 
 
 def load_model_checkpoint(path: str, model: nn.Module, device: torch.device) -> int:
+    """加载最佳 checkpoint。"""
     checkpoint = torch.load(path, map_location=device)
     model.load_state_dict(checkpoint["model"])
     return int(checkpoint.get("epoch", 0))
@@ -704,6 +752,7 @@ def write_summary(
     best_epoch: int,
     best_val_acc: float,
 ) -> None:
+    """将最终实验摘要写入 summary.md。"""
     best = max(test_rows, key=lambda row: row["model_acc"])
     params = train_rows[-1]["params_m"] if train_rows else 0.0
     with open(path, "w") as f:
@@ -749,6 +798,7 @@ def write_summary(
 
 
 def parse_args() -> argparse.Namespace:
+    """定义多模型原型吸引场实验参数。"""
     parser = argparse.ArgumentParser(description="Compare models on noisy prototype attraction field learning.")
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--output-dir", default="./吸引场验证/outputs")
@@ -782,6 +832,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """主流程：构建原型、训练多模型吸引器、按验证集选择最佳 checkpoint 并测试。"""
     args = parse_args()
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
@@ -795,6 +846,7 @@ def main() -> None:
 
     train_loader, val_loader, test_loader, prototype_loader = build_loaders(args)
     schedule = DiffusionSchedule(args.diffusion_steps, device)
+    # 类别原型只由训练子集统计，验证/测试集不参与原型构建。
     prototypes = build_prototypes(prototype_loader, device, args.num_classes)
     model = build_model(args).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -811,6 +863,7 @@ def main() -> None:
     epochs_without_improvement = 0
     best_path = os.path.join(args.output_dir, "best_checkpoint.pt")
     for epoch in range(1, args.epochs + 1):
+        # 每个 epoch 都在固定 train_timestep 下学习 x_t 到原型的收缩映射。
         loss = train_one_epoch(
             model,
             train_loader,
@@ -843,6 +896,7 @@ def main() -> None:
 
         improved = val_metrics["model_acc"] > best_val_acc
         if improved:
+            # 使用验证集 model_acc 选择最佳模型，再在测试集报告结果。
             best_val_acc = val_metrics["model_acc"]
             best_epoch = epoch
             epochs_without_improvement = 0

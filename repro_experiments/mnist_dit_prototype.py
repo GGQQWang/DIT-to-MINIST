@@ -13,8 +13,15 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
 
+# MNIST DiT 原型收缩分类实验。
+# 该版本保留扩散模型的“预测噪声”形式：
+# 输入带噪图像 x_t 和时间步 t，模型预测噪声 eps_pred，
+# 再通过扩散反推公式得到 x0_pred，并让 x0_pred 靠近真实类别原型。
+
+
 @dataclass
 class DiTConfig:
+    """DiT 模型和扩散过程的基础配置。"""
     image_size: int = 28
     patch_size: int = 4
     in_channels: int = 1
@@ -35,6 +42,7 @@ DIT_CONFIGS: Dict[str, Dict[str, int]] = {
 
 
 class PatchEmbed(nn.Module):
+    """将图像切成 patch，并投影为 Transformer token。"""
     def __init__(self, image_size: int, patch_size: int, in_channels: int, hidden_size: int):
         super().__init__()
         if image_size % patch_size != 0:
@@ -51,6 +59,7 @@ class PatchEmbed(nn.Module):
 
 
 class TimestepEmbedder(nn.Module):
+    """将扩散时间步 t 编码为隐藏向量，用于调制 DiT 模块。"""
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
@@ -77,10 +86,12 @@ class TimestepEmbedder(nn.Module):
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """AdaLN 调制：根据时间步嵌入对归一化后的特征做平移和缩放。"""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
 class DiTBlock(nn.Module):
+    """DiT 基本块：自注意力 + MLP，并由时间条件控制 AdaLN。"""
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -105,6 +116,7 @@ class DiTBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        # 时间条件 c 生成 attention 和 MLP 两个分支的 shift、scale、gate。
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         attn_in = modulate(self.norm1(x), shift_msa, scale_msa)
         attn_out = self.attn(attn_in, attn_in, attn_in, need_weights=False)[0]
@@ -115,6 +127,7 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
+    """将 token 特征映射回每个 patch 对应的噪声预测。"""
     def __init__(self, hidden_size: int, out_channels: int):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -131,6 +144,7 @@ class FinalLayer(nn.Module):
 
 
 class ImageDenoisingDiT(nn.Module):
+    """图像去噪 DiT：输入 x_t 和 t，输出与图像同形状的噪声预测。"""
     def __init__(self, cfg: DiTConfig):
         super().__init__()
         self.cfg = cfg
@@ -148,6 +162,7 @@ class ImageDenoisingDiT(nn.Module):
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
+        """初始化 DiT 权重；最后层置零使模型初始输出更稳定。"""
         def init_linear(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -168,9 +183,11 @@ class ImageDenoisingDiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """图像编码为 patch token，并加入固定位置编码。"""
         return self.patch_embed(x) + self.pos_embed
 
     def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        """将 patch 级输出重新拼回 1 x 28 x 28 图像。"""
         batch_size = x.shape[0]
         patch_size = self.cfg.patch_size
         channels = self.cfg.in_channels
@@ -180,6 +197,7 @@ class ImageDenoisingDiT(nn.Module):
         return x.reshape(batch_size, channels, grid_size * patch_size, grid_size * patch_size)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """单次前向：根据带噪图像和时间步预测噪声 eps_pred。"""
         c = self.t_embedder(t)
         x = self.encode(x_t)
         for block in self.blocks:
@@ -189,6 +207,7 @@ class ImageDenoisingDiT(nn.Module):
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+    """生成二维正弦余弦位置编码。"""
     grid_h = torch.arange(grid_size, dtype=torch.float32)
     grid_w = torch.arange(grid_size, dtype=torch.float32)
     grid = torch.meshgrid(grid_w, grid_h, indexing="ij")
@@ -221,6 +240,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos) -> "numpy.ndarray":
 
 
 class DiffusionSchedule:
+    """DDPM 前向加噪日程，提供 q_sample 和一步反推 x0 的公式。"""
     def __init__(self, timesteps: int, device: torch.device):
         betas = torch.linspace(1e-4, 0.02, timesteps, device=device)
         alphas = 1.0 - betas
@@ -230,12 +250,14 @@ class DiffusionSchedule:
         self.sqrt_one_minus_alpha_bars = torch.sqrt(1.0 - alpha_bars)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        """前向扩散：把原图 x0 加噪成 x_t。"""
         shape = (t.shape[0],) + (1,) * (x0.dim() - 1)
         sqrt_ab = self.sqrt_alpha_bars[t].view(shape)
         sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(shape)
         return sqrt_ab * x0 + sqrt_omab * noise
 
     def predict_x0(self, x_t: torch.Tensor, t: torch.Tensor, eps_pred: torch.Tensor) -> torch.Tensor:
+        """根据模型预测的噪声 eps_pred，一步反推出 x0_pred。"""
         shape = (t.shape[0],) + (1,) * (x_t.dim() - 1)
         sqrt_ab = self.sqrt_alpha_bars[t].view(shape)
         sqrt_omab = self.sqrt_one_minus_alpha_bars[t].view(shape)
@@ -243,6 +265,7 @@ class DiffusionSchedule:
 
 
 def build_model(args: argparse.Namespace) -> ImageDenoisingDiT:
+    """根据命令行选择 DiT-B、DiT-S 或 DiT-XS。"""
     size_cfg = DIT_CONFIGS[args.dit_size]
     cfg = DiTConfig(
         depth=size_cfg["depth"],
@@ -255,6 +278,7 @@ def build_model(args: argparse.Namespace) -> ImageDenoisingDiT:
 
 
 def get_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+    """加载 MNIST，并归一化到 [-1, 1]。"""
     transform = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -294,6 +318,11 @@ def train_one_epoch(
     train_timestep_min: int,
     train_timestep_max: int,
 ) -> float:
+    """训练一个 epoch。
+
+    target_mode=noise：普通扩散去噪，直接拟合真实噪声。
+    target_mode=prototype：先预测噪声并一步反推 x0_pred，再让 x0_pred 靠近真实类别原型。
+    """
     model.train()
     total_loss = 0.0
     total_count = 0
@@ -307,6 +336,7 @@ def train_one_epoch(
         if target_mode == "noise":
             loss = F.mse_loss(eps_pred, noise)
         elif target_mode == "prototype":
+            # 这里不是还原原始个体图像，而是让反推出的图像靠近类别平均原型。
             x0_pred = schedule.predict_x0(x_t, t, eps_pred).clamp(-1, 1)
             loss = F.mse_loss(x0_pred, image_prototypes[labels])
         else:
@@ -332,6 +362,7 @@ def build_prototypes(
     device: torch.device,
     num_classes: int = 10,
 ) -> torch.Tensor:
+    """计算每个数字类别的平均图像原型 mu_c。"""
     image_sums = torch.zeros(num_classes, 1, 28, 28, device=device)
     counts = torch.zeros(num_classes, device=device)
 
@@ -349,6 +380,7 @@ def build_prototypes(
 
 
 def nearest_image_proto(images: torch.Tensor, image_prototypes: torch.Tensor) -> torch.Tensor:
+    """最近原型分类：选择 MSE 距离最小的类别。"""
     errors = (images[:, None] - image_prototypes[None]).pow(2).mean(dim=(2, 3, 4))
     return errors.argmin(dim=1)
 
@@ -362,6 +394,10 @@ def denoise_images(
     eval_timesteps: Iterable[int],
     noise_repeats: int,
 ) -> torch.Tensor:
+    """对图像做加噪和单次 DiT 去噪，并可对多个时间步/噪声重复取平均。
+
+    注意：每个时间步内部都是一次模型前向预测噪声，不是多步扩散采样。
+    """
     batch_size = images.shape[0]
     x0_pred_sum = torch.zeros_like(images)
     count = 0
@@ -372,6 +408,7 @@ def denoise_images(
             noise = torch.randn_like(images)
             x_t = schedule.q_sample(images, t, noise)
             eps_pred = model(x_t, t)
+            # 单次预测 eps_pred 后，用闭式公式一步反推 x0_pred。
             x0_pred_sum += schedule.predict_x0(x_t, t, eps_pred)
             count += 1
 
@@ -388,6 +425,7 @@ def evaluate_prototypes(
     eval_timesteps: Iterable[int],
     noise_repeats: int,
 ) -> Tuple[Dict[str, float], torch.Tensor]:
+    """比较 clean/noisy/denoised 三种图像的最近原型分类准确率。"""
     model.eval()
     correct = {
         "image_clean": 0,
@@ -403,6 +441,7 @@ def evaluate_prototypes(
         noisy_images = denoise_image_baseline(images, schedule, device, eval_timesteps, noise_repeats)
         denoised_images = denoise_images(model, images, schedule, device, eval_timesteps, noise_repeats)
 
+        # image_denoised 是核心指标：模型原型化输出是否比原图/加噪图更适合原型匹配。
         preds = {
             "image_clean": nearest_image_proto(images, image_prototypes),
             "image_noisy": nearest_image_proto(noisy_images, image_prototypes),
@@ -426,6 +465,7 @@ def denoise_image_baseline(
     eval_timesteps: Iterable[int],
     noise_repeats: int,
 ) -> torch.Tensor:
+    """不经过模型，仅对加噪图像求平均，作为 noisy baseline。"""
     image_sum = torch.zeros_like(images)
     count = 0
     for timestep in eval_timesteps:
@@ -444,6 +484,7 @@ def save_checkpoint(
     epoch: int,
     args: argparse.Namespace,
 ) -> None:
+    """保存训练 checkpoint。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
         {
@@ -457,6 +498,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(path: str, model: ImageDenoisingDiT, device: torch.device, optimizer=None) -> int:
+    """加载 checkpoint，并返回保存时的 epoch。"""
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"])
     if optimizer is not None and "optimizer" in ckpt:
@@ -465,6 +507,7 @@ def load_checkpoint(path: str, model: ImageDenoisingDiT, device: torch.device, o
 
 
 def parse_eval_timesteps(value: str, diffusion_steps: int) -> Tuple[int, ...]:
+    """解析评估使用的扩散时间步。"""
     steps = tuple(int(x.strip()) for x in value.split(",") if x.strip())
     if not steps:
         raise ValueError("--eval-timesteps cannot be empty")
@@ -475,6 +518,7 @@ def parse_eval_timesteps(value: str, diffusion_steps: int) -> Tuple[int, ...]:
 
 
 def parse_timestep_sweep(value: str, diffusion_steps: int) -> Tuple[Tuple[int, ...], ...]:
+    """解析噪声时间步扫描配置，分号分隔不同评估组。"""
     groups = []
     for group in value.split(";"):
         group = group.strip()
@@ -486,6 +530,7 @@ def parse_timestep_sweep(value: str, diffusion_steps: int) -> Tuple[Tuple[int, .
 
 
 def parse_args() -> argparse.Namespace:
+    """定义 MNIST DiT 原型收缩实验参数。"""
     parser = argparse.ArgumentParser(description="Unconditional DiT image denoising with prototype matching for MNIST.")
     parser.add_argument("--mode", choices=["train", "eval", "sweep"], default="train")
     parser.add_argument("--data-dir", default="./data")
@@ -518,6 +563,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_device(name: str) -> torch.device:
+    """自动选择可用设备。"""
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -540,6 +586,7 @@ def ensure_dir(path: str) -> None:
 
 
 def append_training_log(path: str, epoch: int, train_loss: float, metrics: Dict[str, float]) -> None:
+    """追加保存每个 epoch 的训练损失和评估准确率。"""
     ensure_dir(os.path.dirname(path) or ".")
     fieldnames = ["epoch", "train_loss", *metrics.keys()]
     write_header = not os.path.exists(path)
@@ -553,6 +600,7 @@ def append_training_log(path: str, epoch: int, train_loss: float, metrics: Dict[
 
 
 def write_sweep_log(path: str, rows: Iterable[Dict[str, float]]) -> None:
+    """保存不同 eval_timesteps 组合下的扫描结果。"""
     rows = list(rows)
     if not rows:
         return
@@ -564,6 +612,7 @@ def write_sweep_log(path: str, rows: Iterable[Dict[str, float]]) -> None:
 
 
 def write_confusion_csv(path: str, confusion: torch.Tensor) -> None:
+    """保存 image_denoised 预测结果的混淆矩阵。"""
     ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -573,6 +622,7 @@ def write_confusion_csv(path: str, confusion: torch.Tensor) -> None:
 
 
 def save_image_prototypes(path: str, image_prototypes: torch.Tensor) -> None:
+    """保存 0-9 类平均原型图像。"""
     ensure_dir(os.path.dirname(path) or ".")
     images = (image_prototypes.detach().cpu().clamp(-1, 1) + 1) / 2
     save_image(images, path, nrow=image_prototypes.shape[0], padding=2)
@@ -587,6 +637,7 @@ def save_noise_grid(
     timesteps: Iterable[int],
     max_images: int = 8,
 ) -> None:
+    """保存不同时间步的加噪可视化。"""
     ensure_dir(os.path.dirname(path) or ".")
     images, _ = next(iter(loader))
     images = images[:max_images].to(device)
@@ -609,6 +660,7 @@ def save_denoising_grid(
     timesteps: Iterable[int],
     max_images: int = 8,
 ) -> None:
+    """保存带噪图像和一步反推结果的可视化对比。"""
     ensure_dir(os.path.dirname(path) or ".")
     model.eval()
     images, _ = next(iter(loader))
@@ -627,6 +679,7 @@ def save_denoising_grid(
 
 
 def main() -> None:
+    """主入口：构建原型、训练/评估 DiT，并保存指标和可视化结果。"""
     args = parse_args()
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
@@ -642,6 +695,7 @@ def main() -> None:
     viz_timesteps = parse_eval_timesteps(args.viz_timesteps, args.diffusion_steps)
     ensure_dir(args.output_dir)
     save_noise_grid(os.path.join(args.output_dir, "noise_grid.png"), train_loader, schedule, device, viz_timesteps)
+    # 类别原型只由训练集构建，避免使用测试集信息。
     image_prototypes = build_prototypes(train_loader, device, model.cfg.num_classes)
     save_image_prototypes(os.path.join(args.output_dir, "image_prototypes.png"), image_prototypes)
 
@@ -652,6 +706,7 @@ def main() -> None:
     )
 
     if args.mode == "eval":
+        # eval 模式只加载已有 checkpoint，不继续训练。
         load_checkpoint(args.checkpoint, model, device)
         save_denoising_grid(os.path.join(args.output_dir, "denoising_grid.png"), model, test_loader, schedule, device, eval_timesteps)
         metrics, confusion = evaluate_prototypes(
@@ -668,6 +723,7 @@ def main() -> None:
         return
 
     if args.mode == "sweep":
+        # sweep 模式用于分析不同评估噪声强度对原型分类的影响。
         load_checkpoint(args.checkpoint, model, device)
         sweep_rows = []
         for timestep_group in parse_timestep_sweep(args.timestep_sweep, args.diffusion_steps):

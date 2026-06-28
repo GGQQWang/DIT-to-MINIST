@@ -10,7 +10,13 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
 
+# Wine 数据集 KDE 分类实验。
+# 核心思想：不训练神经网络，而是保存每一类训练样本，
+# 测试时估计样本在各类别条件分布下的核密度，选择密度最高的类别。
+
+
 def parse_float_list(value: str) -> List[float]:
+    """将命令行中的带宽字符串解析为浮点数列表。"""
     values = [float(item.strip()) for item in value.split(",") if item.strip()]
     if not values:
         raise ValueError("The bandwidth list cannot be empty.")
@@ -18,6 +24,7 @@ def parse_float_list(value: str) -> List[float]:
 
 
 def resolve_device(name: str) -> torch.device:
+    """根据命令行参数选择 CPU、CUDA 或 Apple MPS。"""
     if name == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
@@ -28,10 +35,12 @@ def resolve_device(name: str) -> torch.device:
 
 
 def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+    """加载 Wine 数据集，并完成分层划分和特征标准化。"""
     wine = load_wine()
     features = wine.data.astype("float32")
     labels = wine.target.astype("int64")
 
+    # Wine 样本量较小，使用 stratify 保证训练集和测试集类别比例一致。
     x_train, x_test, y_train, y_test = train_test_split(
         features,
         labels,
@@ -40,6 +49,8 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
         stratify=labels,
     )
 
+    # KDE 使用欧氏距离，必须先标准化特征，避免大尺度特征主导距离。
+    # 注意：标准化器只在训练集上 fit，避免测试集信息泄漏。
     scaler = StandardScaler()
     x_train = scaler.fit_transform(x_train).astype("float32")
     x_test = scaler.transform(x_test).astype("float32")
@@ -69,6 +80,7 @@ def build_loaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
 
 
 def as_features(samples: torch.Tensor) -> torch.Tensor:
+    """Wine 样本本身就是 13 维特征向量，不需要图像展平。"""
     return samples.float()
 
 
@@ -78,6 +90,7 @@ def collect_train_by_class(
     device: torch.device,
     num_classes: int,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """按类别收集训练特征，供 KDE 逐类估计条件密度。"""
     features_by_class: List[List[torch.Tensor]] = [[] for _ in range(num_classes)]
     counts = torch.zeros(num_classes, dtype=torch.long)
 
@@ -99,6 +112,7 @@ def collect_train_by_class(
 
 
 def pairwise_squared_distances(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """计算两个样本矩阵之间的两两欧氏距离平方。"""
     x_norm = x.pow(2).sum(dim=1, keepdim=True)
     y_norm = y.pow(2).sum(dim=1).unsqueeze(0)
     distances = x_norm + y_norm - 2.0 * x @ y.t()
@@ -118,6 +132,7 @@ def gaussian_log_scores(
     use_priors: bool,
     class_counts: torch.Tensor,
 ) -> torch.Tensor:
+    """使用 Gaussian 核计算每个测试样本在每个类别下的对数密度分数。"""
     scores = []
     h2 = bandwidth * bandwidth
     total_count = class_counts.sum().item()
@@ -127,9 +142,11 @@ def gaussian_log_scores(
         for start in range(0, train_features.shape[0], train_chunk_size):
             chunk = train_features[start : start + train_chunk_size]
             d2 = pairwise_squared_distances(x, chunk)
+            # Gaussian 核：距离越近贡献越大，距离越远贡献按指数衰减。
             chunk_log_sum = torch.logsumexp(-d2 / (2.0 * h2), dim=1)
             log_sum = logaddexp_pair(log_sum, chunk_log_sum)
 
+        # 对同一类别的训练样本求平均，得到该类别的 KDE 密度估计。
         log_score = log_sum - torch.log(torch.tensor(train_features.shape[0], device=x.device, dtype=x.dtype))
         if use_priors:
             prior = class_counts[cls].item() / total_count
@@ -149,6 +166,7 @@ def epanechnikov_log_scores(
     class_counts: torch.Tensor,
     eps: float = 1e-12,
 ) -> torch.Tensor:
+    """使用 Epanechnikov 核计算每个测试样本在每个类别下的对数密度分数。"""
     scores = []
     h2 = bandwidth * bandwidth
     total_count = class_counts.sum().item()
@@ -158,6 +176,7 @@ def epanechnikov_log_scores(
         for start in range(0, train_features.shape[0], train_chunk_size):
             chunk = train_features[start : start + train_chunk_size]
             d2 = pairwise_squared_distances(x, chunk)
+            # Epanechnikov 核：带宽范围内有贡献，范围外贡献为 0。
             kernel_values = (1.0 - d2 / h2).clamp_min_(0.0)
             kernel_sum += kernel_values.sum(dim=1)
 
@@ -180,12 +199,14 @@ def predict_batch(
     use_priors: bool,
     class_counts: torch.Tensor,
 ) -> torch.Tensor:
+    """对一个 batch 的测试样本预测类别。"""
     if kernel == "gaussian":
         scores = gaussian_log_scores(x, class_tensors, bandwidth, train_chunk_size, use_priors, class_counts)
     elif kernel == "epanechnikov":
         scores = epanechnikov_log_scores(x, class_tensors, bandwidth, train_chunk_size, use_priors, class_counts)
     else:
         raise ValueError(f"Unsupported kernel: {kernel}")
+    # 选择条件核密度估计值最大的类别作为预测结果。
     return scores.argmax(dim=1)
 
 
@@ -201,6 +222,7 @@ def evaluate_kernel(
     class_counts: torch.Tensor,
     num_classes: int,
 ) -> Tuple[float, torch.Tensor]:
+    """评估指定核函数和带宽下的分类准确率与混淆矩阵。"""
     correct = 0
     total = 0
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
@@ -219,6 +241,7 @@ def evaluate_kernel(
 
 
 def write_rows(path: str, rows: Iterable[Dict[str, float]]) -> None:
+    """保存不同核函数和带宽的实验结果。"""
     rows = list(rows)
     if not rows:
         return
@@ -230,6 +253,7 @@ def write_rows(path: str, rows: Iterable[Dict[str, float]]) -> None:
 
 
 def write_confusion(path: str, confusion: torch.Tensor) -> None:
+    """保存最佳配置对应的混淆矩阵。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
@@ -239,6 +263,7 @@ def write_confusion(path: str, confusion: torch.Tensor) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """定义 Wine KDE 实验的可调参数。"""
     parser = argparse.ArgumentParser(description="Non-parametric KDE kernel classifier for the Wine dataset.")
     parser.add_argument("--output-dir", default="./outputs_wine_kernel")
     parser.add_argument("--kernels", default="gaussian,epanechnikov")
@@ -257,6 +282,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """主入口：加载数据、按类别收集训练样本、搜索核函数和带宽。"""
     args = parse_args()
     device = resolve_device(args.device)
     kernels = [item.strip() for item in args.kernels.split(",") if item.strip()]
