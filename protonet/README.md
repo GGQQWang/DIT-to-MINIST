@@ -59,6 +59,8 @@ python protonet/noisy_protonet.py \
   --loss-type distance \
   --feature-normalization layernorm \
   --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
   --shot 5 \
   --query 15 \
   --train-episodes 5000 \
@@ -66,8 +68,10 @@ python protonet/noisy_protonet.py \
   --eval-interval 500 \
   --hidden-channels 64 \
   --embedding-dim 64 \
-  --lr 1e-3 \
-  --weight-decay 1e-4
+  --optimizer sgd \
+  --lr 0.01 \
+  --momentum 0.9 \
+  --weight-decay 5e-4
 ```
 
 Recommended Omniglot run:
@@ -85,6 +89,8 @@ python protonet/noisy_protonet.py \
   --loss-type distance \
   --feature-normalization layernorm \
   --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
   --shot 5 \
   --query 15 \
   --train-episodes 5000 \
@@ -92,8 +98,10 @@ python protonet/noisy_protonet.py \
   --eval-interval 500 \
   --hidden-channels 64 \
   --embedding-dim 64 \
-  --lr 1e-3 \
-  --weight-decay 1e-4
+  --optimizer sgd \
+  --lr 0.01 \
+  --momentum 0.9 \
+  --weight-decay 5e-4
 ```
 
 Recommended miniImageNet run:
@@ -116,6 +124,8 @@ python protonet/noisy_protonet.py \
   --loss-type distance \
   --feature-normalization layernorm \
   --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
   --shot 5 \
   --query 15 \
   --train-episodes 10000 \
@@ -123,8 +133,10 @@ python protonet/noisy_protonet.py \
   --eval-interval 1000 \
   --hidden-channels 64 \
   --embedding-dim 64 \
-  --lr 1e-3 \
-  --weight-decay 1e-4
+  --optimizer sgd \
+  --lr 0.01 \
+  --momentum 0.9 \
+  --weight-decay 5e-4
 ```
 
 Option B: local ImageFolder layout:
@@ -157,6 +169,8 @@ python protonet/noisy_protonet.py \
   --loss-type distance \
   --feature-normalization layernorm \
   --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
   --shot 5 \
   --query 15 \
   --train-episodes 10000 \
@@ -164,8 +178,10 @@ python protonet/noisy_protonet.py \
   --eval-interval 1000 \
   --hidden-channels 64 \
   --embedding-dim 64 \
-  --lr 1e-3 \
-  --weight-decay 1e-4
+  --optimizer sgd \
+  --lr 0.01 \
+  --momentum 0.9 \
+  --weight-decay 5e-4
 ```
 
 Key outputs:

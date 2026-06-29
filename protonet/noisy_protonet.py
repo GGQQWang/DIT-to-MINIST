@@ -464,6 +464,7 @@ def evaluate(
     device: torch.device,
     seed: int,
     eval_noise_timestep: int,
+    eval_way: int,
 ) -> Dict[str, float]:
     encoder.eval()
     rng = random.Random(seed)
@@ -472,7 +473,7 @@ def evaluate(
     with torch.no_grad():
         for _ in range(args.eval_episodes):
             support_x, support_y, query_x, query_y = indexed_dataset.sample_episode(
-                args.way,
+                eval_way,
                 args.shot,
                 args.query,
                 device,
@@ -484,7 +485,7 @@ def evaluate(
                 support_y,
                 query_x,
                 query_y,
-                args.way,
+                eval_way,
                 args,
                 schedule,
                 eval_noise_timestep,
@@ -503,11 +504,25 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
     test_dataset, _, test_num_classes = build_dataset(args, train=False)
     train_indexed = IndexedDataset(train_dataset, num_classes)
     test_indexed = IndexedDataset(test_dataset, test_num_classes)
-    if args.way > num_classes or args.way > test_num_classes:
-        raise ValueError("--way cannot exceed the number of classes in train/test split")
+    train_way = args.train_way if args.train_way > 0 else args.way
+    eval_way = args.eval_way if args.eval_way > 0 else args.way
+    if train_way > num_classes:
+        raise ValueError("--train-way cannot exceed the number of training classes")
+    if eval_way > test_num_classes:
+        raise ValueError("--eval-way cannot exceed the number of evaluation classes")
 
     encoder = Conv4Encoder(in_channels, args.hidden_channels, args.embedding_dim).to(device)
-    optimizer = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(
+            encoder.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+        )
+    elif args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"unsupported optimizer: {args.optimizer}")
     schedule = DiffusionSchedule(args.diffusion_steps, device)
     train_rng = random.Random(args.seed + 10_000 + train_noise_timestep)
 
@@ -515,7 +530,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
     for episode in range(1, args.train_episodes + 1):
         encoder.train()
         support_x, support_y, query_x, query_y = train_indexed.sample_episode(
-            args.way,
+            train_way,
             args.shot,
             args.query,
             device,
@@ -527,7 +542,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             support_y,
             query_x,
             query_y,
-            args.way,
+            train_way,
             args,
             schedule,
             train_noise_timestep,
@@ -547,6 +562,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 device,
                 seed=args.seed + 50_000 + episode,
                 eval_noise_timestep=0,
+                eval_way=eval_way,
             )
             eval_same = evaluate(
                 encoder,
@@ -555,10 +571,13 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 device,
                 seed=args.seed + 60_000 + episode,
                 eval_noise_timestep=train_noise_timestep,
+                eval_way=eval_way,
             )
             row = {
                 "train_noise_timestep": train_noise_timestep,
                 "episode": episode,
+                "train_way": train_way,
+                "eval_way": eval_way,
                 "train_loss": float(loss.item()),
                 "train_acc": train_metrics["acc"],
                 "eval_clean_acc": eval_clean["acc"],
@@ -608,6 +627,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--var-gamma", type=float, default=1.0)
     parser.add_argument("--contrast-temperature", type=float, default=0.2)
     parser.add_argument("--way", type=int, default=5)
+    parser.add_argument("--train-way", type=int, default=0, help="0 means use --way.")
+    parser.add_argument("--eval-way", type=int, default=0, help="0 means use --way.")
     parser.add_argument("--shot", type=int, default=5)
     parser.add_argument("--query", type=int, default=15)
     parser.add_argument("--train-episodes", type=int, default=5000)
@@ -616,7 +637,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--normalize-embeddings", action="store_true")
+    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
