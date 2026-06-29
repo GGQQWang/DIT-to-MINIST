@@ -226,6 +226,42 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --embedding-dim 64
 ```
 
+Adam schedule variant:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+
+CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
+  --device cuda \
+  --dataset miniimagenet-hf \
+  --hf-dataset-id GATE-engine/mini_imagenet \
+  --eval-split test \
+  --image-size 84 \
+  --output-dir ./protonet/outputs/ce_feature_noise_t250_adam_step_20way_train_5way_eval \
+  --train-noise-timesteps 250 \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type ce \
+  --feature-normalization none \
+  --distance-reduction mean \
+  --optimizer adam \
+  --lr 1e-3 \
+  --lr-step-size 2000 \
+  --lr-gamma 0.5 \
+  --weight-decay 0 \
+  --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
+  --shot 5 \
+  --query 15 \
+  --train-episodes 20000 \
+  --eval-episodes 600 \
+  --eval-interval 1000 \
+  --hidden-channels 64 \
+  --embedding-dim 64
+```
+
 The default ProtoNet uses squared Euclidean distance without embedding normalization.
 
 To reproduce the older image-noise ProtoNet baseline, add:

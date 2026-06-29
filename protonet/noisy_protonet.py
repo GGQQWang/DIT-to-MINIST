@@ -519,10 +519,15 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             momentum=args.momentum,
             weight_decay=args.weight_decay,
         )
+    elif args.optimizer == "adam":
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
         raise ValueError(f"unsupported optimizer: {args.optimizer}")
+    scheduler = None
+    if args.lr_step_size > 0:
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma)
     schedule = DiffusionSchedule(args.diffusion_steps, device)
     train_rng = random.Random(args.seed + 10_000 + train_noise_timestep)
 
@@ -553,6 +558,8 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
         if args.grad_clip > 0:
             nn.utils.clip_grad_norm_(encoder.parameters(), args.grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if episode % args.eval_interval == 0 or episode == args.train_episodes:
             eval_clean = evaluate(
@@ -578,6 +585,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 "episode": episode,
                 "train_way": train_way,
                 "eval_way": eval_way,
+                "lr": optimizer.param_groups[0]["lr"],
                 "train_loss": float(loss.item()),
                 "train_acc": train_metrics["acc"],
                 "eval_clean_acc": eval_clean["acc"],
@@ -637,8 +645,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-channels", type=int, default=64)
     parser.add_argument("--embedding-dim", type=int, default=64)
     parser.add_argument("--normalize-embeddings", action="store_true")
-    parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+    parser.add_argument("--optimizer", choices=["adam", "adamw", "sgd"], default="adamw")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr-step-size", type=int, default=0, help="0 disables StepLR. Unit: episodes.")
+    parser.add_argument("--lr-gamma", type=float, default=0.5)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=5.0)
