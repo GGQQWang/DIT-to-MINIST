@@ -189,6 +189,43 @@ Key outputs:
 - `train_eval_log.csv`
 - `final_results.csv`
 
+## Current miniImageNet run
+
+This is the current diagnostic run: feature-space query noise at `t=250`, original ProtoNet CE loss, no feature LayerNorm, SGD optimizer, 20-way training and 5-way evaluation.
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+
+CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
+  --device cuda \
+  --dataset miniimagenet-hf \
+  --hf-dataset-id GATE-engine/mini_imagenet \
+  --eval-split test \
+  --image-size 84 \
+  --output-dir ./protonet/outputs/ce_feature_noise_t250_sgd_20way_train_5way_eval \
+  --train-noise-timesteps 250 \
+  --noise-space feature \
+  --train-noise-target query \
+  --eval-noise-target query \
+  --loss-type ce \
+  --feature-normalization none \
+  --distance-reduction mean \
+  --optimizer sgd \
+  --lr 0.01 \
+  --momentum 0.9 \
+  --weight-decay 5e-4 \
+  --way 5 \
+  --train-way 20 \
+  --eval-way 5 \
+  --shot 5 \
+  --query 15 \
+  --train-episodes 20000 \
+  --eval-episodes 600 \
+  --eval-interval 1000 \
+  --hidden-channels 64 \
+  --embedding-dim 64
+```
+
 The default ProtoNet uses squared Euclidean distance without embedding normalization.
 
 To reproduce the older image-noise ProtoNet baseline, add:
