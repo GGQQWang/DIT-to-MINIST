@@ -301,10 +301,11 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --eval-episodes 600 \
   --eval-interval 1000 \
   --hidden-channels 64 \
+  --encoder-head none \
   --embedding-dim 64
 ```
 
-The default ProtoNet uses squared Euclidean distance without embedding normalization.
+The default ProtoNet uses squared Euclidean distance without embedding normalization. `--encoder-head none` means Conv4 outputs the 64-channel pooled feature directly; `--encoder-head linear` restores the older extra projection head.
 
 To reproduce the older image-noise ProtoNet baseline, add:
 

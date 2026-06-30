@@ -180,11 +180,13 @@ class Conv4Encoder(nn.Module):
     """标准 ProtoNet 风格的 Conv4 编码器。
 
     对 miniImageNet 且 --hidden-channels 64 时：
-    RGB 图像 -> 4 个 64 通道 ConvBlock -> 全局平均池化 ->
-    Linear(64, embedding_dim)。所有参数都会交给 optimizer 更新。
+    RGB 图像 -> 4 个 64 通道 ConvBlock -> 全局平均池化。
+    默认不加 Linear head，更接近原始 ProtoNet 的 Conv4 设置。
+    如果显式设置 --encoder-head linear，才会追加 Linear(64, embedding_dim)。
+    所有参数都会交给 optimizer 更新。
     """
 
-    def __init__(self, in_channels: int, hidden_channels: int, embedding_dim: int):
+    def __init__(self, in_channels: int, hidden_channels: int, embedding_dim: int, encoder_head: str):
         super().__init__()
         self.features = nn.Sequential(
             ConvBlock(in_channels, hidden_channels),
@@ -192,7 +194,14 @@ class Conv4Encoder(nn.Module):
             ConvBlock(hidden_channels, hidden_channels),
             ConvBlock(hidden_channels, hidden_channels),
         )
-        self.proj = nn.Linear(hidden_channels, embedding_dim)
+        if encoder_head == "none":
+            self.proj = nn.Identity()
+            self.output_dim = hidden_channels
+        elif encoder_head == "linear":
+            self.proj = nn.Linear(hidden_channels, embedding_dim)
+            self.output_dim = embedding_dim
+        else:
+            raise ValueError(f"unsupported encoder head: {encoder_head}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.features(x)
@@ -631,11 +640,11 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
     if eval_way > test_num_classes:
         raise ValueError("--eval-way cannot exceed the number of evaluation classes")
 
-    encoder = Conv4Encoder(in_channels, args.hidden_channels, args.embedding_dim).to(device)
+    encoder = Conv4Encoder(in_channels, args.hidden_channels, args.embedding_dim, args.encoder_head).to(device)
     denoiser = None
     if args.aux_denoise:
         denoiser = ResidualDenoiserMLP(
-            args.embedding_dim,
+            encoder.output_dim,
             hidden_multiplier=args.denoiser_hidden_multiplier,
         ).to(device)
 
@@ -788,7 +797,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-episodes", type=int, default=300)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--hidden-channels", type=int, default=64)
-    parser.add_argument("--embedding-dim", type=int, default=64)
+    parser.add_argument("--embedding-dim", type=int, default=64, help="Only used when --encoder-head linear.")
+    parser.add_argument("--encoder-head", choices=["none", "linear"], default="none")
     parser.add_argument("--normalize-embeddings", action="store_true")
     parser.add_argument("--optimizer", choices=["adam", "adamw", "sgd"], default="adamw")
     parser.add_argument("--lr", type=float, default=1e-3)
