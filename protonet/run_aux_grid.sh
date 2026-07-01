@@ -50,6 +50,7 @@ for lambda in "${LAMBDA_LIST[@]}"; do
       --train-schedule alternate \
       --main-steps 5 \
       --aux-steps 1 \
+      --freeze-bn-in-aux \
       --aux-noise-mode ddpm \
       --aux-noise-timestep "${AUX_NOISE_TIMESTEP}" \
       --lambda-denoise "${lambda}" \

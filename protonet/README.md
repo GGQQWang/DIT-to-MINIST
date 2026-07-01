@@ -288,6 +288,7 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --train-schedule alternate \
   --main-steps 5 \
   --aux-steps 1 \
+  --freeze-bn-in-aux \
   --aux-noise-mode ddpm \
   --aux-noise-timestep 200 \
   --lambda-denoise 0.3 \

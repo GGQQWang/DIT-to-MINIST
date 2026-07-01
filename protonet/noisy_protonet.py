@@ -564,6 +564,23 @@ def mean_metrics(rows: Sequence[Dict[str, float]]) -> Dict[str, float]:
     return {key: float(sum(row[key] for row in rows) / len(rows)) for key in keys}
 
 
+def phase_mean(rows: Sequence[Dict[str, float]], phase: str, key: str) -> float:
+    values = [row[key] for row in rows if row["train_phase"] == phase]
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def phase_count(rows: Sequence[Dict[str, float]], phase: str) -> int:
+    return sum(1 for row in rows if row["train_phase"] == phase)
+
+
+def set_batchnorm_eval(module: nn.Module) -> None:
+    for child in module.modules():
+        if isinstance(child, nn.modules.batchnorm._BatchNorm):
+            child.eval()
+
+
 def write_csv(path: str, rows: Iterable[Dict]) -> None:
     rows = list(rows)
     if not rows:
@@ -760,6 +777,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
     train_rng = random.Random(args.seed + 10_000 + train_noise_timestep)
 
     rows: List[Dict] = []
+    interval_rows: List[Dict[str, float]] = []
     for episode in range(1, args.train_episodes + 1):
         encoder.train()
         if denoiser is not None:
@@ -777,6 +795,10 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             else:
                 loss_mode = "aux"
                 train_phase = "aux"
+        if train_phase == "aux" and args.freeze_bn_in_aux:
+            # 辅助去噪阶段不更新 BatchNorm running mean/var，避免 aux episode
+            # 的特征分布污染主 ProtoNet 分类使用的 BN 统计。
+            set_batchnorm_eval(encoder)
         # 每次迭代都采样一个新的随机 episode。
         support_x, support_y, query_x, query_y = train_indexed.sample_episode(
             train_way,
@@ -806,6 +828,17 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+        interval_rows.append(
+            {
+                "train_phase": train_phase,
+                "loss": float(loss.item()),
+                "main_loss": train_metrics["main_loss"],
+                "denoise_loss": train_metrics["denoise_loss"],
+                "weighted_denoise_loss": train_metrics["weighted_denoise_loss"],
+                "acc": train_metrics["acc"],
+                "margin": train_metrics["margin"],
+            }
+        )
 
         if episode % args.eval_interval == 0 or episode == args.train_episodes:
             eval_clean = evaluate(
@@ -814,7 +847,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 test_indexed,
                 args,
                 device,
-                seed=args.seed + 50_000 + episode,
+                seed=args.seed + args.eval_seed_offset,
                 eval_noise_timestep=0,
                 eval_way=eval_way,
             )
@@ -825,10 +858,17 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 "noise_rho": args.noise_rho if args.aux_denoise and args.aux_noise_mode == "relative" else 0.0,
                 "episode": episode,
                 "train_phase": train_phase,
+                "interval_main_steps": phase_count(interval_rows, "main"),
+                "interval_aux_steps": phase_count(interval_rows, "aux"),
                 "train_way": train_way,
                 "eval_way": eval_way,
                 "lr": optimizer.param_groups[0]["lr"],
                 "train_loss": float(loss.item()),
+                "interval_main_loss": phase_mean(interval_rows, "main", "main_loss"),
+                "interval_aux_loss": phase_mean(interval_rows, "aux", "denoise_loss"),
+                "interval_weighted_aux_loss": phase_mean(interval_rows, "aux", "weighted_denoise_loss"),
+                "interval_main_acc": phase_mean(interval_rows, "main", "acc"),
+                "interval_main_margin": phase_mean(interval_rows, "main", "margin"),
                 "main_loss": train_metrics["main_loss"],
                 "denoise_loss": train_metrics["denoise_loss"],
                 "weighted_denoise_loss": train_metrics["weighted_denoise_loss"],
@@ -847,9 +887,12 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 f"t={train_noise_timestep} episode={episode} phase={train_phase} "
                 f"loss={loss.item():.4f} main_loss={train_metrics['main_loss']:.4f} "
                 f"denoise_loss={train_metrics['denoise_loss']:.4f} "
+                f"interval_main_loss={row['interval_main_loss']:.4f} "
+                f"interval_aux_loss={row['interval_aux_loss']:.4f} "
                 f"train_acc={train_metrics['acc']:.4f} clean_acc={eval_clean['acc']:.4f} "
                 f"clean_margin={eval_clean['margin']:.4f}"
             )
+            interval_rows = []
     return rows
 
 
@@ -878,6 +921,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-schedule", choices=["joint", "alternate"], default="joint")
     parser.add_argument("--main-steps", type=int, default=5, help="Main-task episodes per cycle when --train-schedule alternate.")
     parser.add_argument("--aux-steps", type=int, default=1, help="Auxiliary episodes per cycle when --train-schedule alternate.")
+    parser.add_argument("--freeze-bn-in-aux", action="store_true")
+    parser.add_argument("--eval-seed-offset", type=int, default=50_000)
     parser.add_argument("--noise-rho", type=float, default=0.2)
     parser.add_argument("--aux-noise-mode", choices=["relative", "ddpm"], default="relative")
     parser.add_argument("--aux-noise-timestep", type=int, default=200)
