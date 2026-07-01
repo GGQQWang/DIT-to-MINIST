@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 扫描辅助原型去噪模块的两个关键超参：
-# - noise-rho: 特征噪声强度，sigma = rho * Std(z_q)
-# - lambda-denoise: 辅助去噪损失权重
+# 扫描辅助原型去噪模块的损失权重。
+# 当前版本固定使用 DDPM feature-space t=200：
+# z_t = sqrt(alpha_bar_t) * z_q + sqrt(1-alpha_bar_t) * Std(z_q) * eps
 #
 # 用法：
 #   bash protonet/run_aux_grid.sh
@@ -11,25 +11,23 @@ set -euo pipefail
 # 可选覆盖：
 #   GPU_ID=1 TRAIN_EPISODES=20000 EVAL_EPISODES=600 bash protonet/run_aux_grid.sh
 
-GPU_ID="${GPU_ID:-1}"
-TRAIN_EPISODES="${TRAIN_EPISODES:-20000}"
+GPU_ID="${GPU_ID:-2}"
+TRAIN_EPISODES="${TRAIN_EPISODES:-10000}"
 EVAL_EPISODES="${EVAL_EPISODES:-600}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-1000}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
-RHO_LIST=(0.1 0.2 0.3 0.5)
-LAMBDA_LIST=(0.1 0.05 0.3)
+AUX_NOISE_TIMESTEP="${AUX_NOISE_TIMESTEP:-200}"
+LAMBDA_LIST=(0.1 0.3 1.0)
 
 export HF_ENDPOINT
 
-for rho in "${RHO_LIST[@]}"; do
-  for lambda in "${LAMBDA_LIST[@]}"; do
-    rho_tag="${rho/./p}"
+for lambda in "${LAMBDA_LIST[@]}"; do
     lambda_tag="${lambda/./p}"
-    output_dir="./protonet/outputs/aux_grid_rho${rho_tag}_lambda${lambda_tag}_miniimagenet_20way_train_5way_eval"
+    output_dir="./protonet/outputs/aux_ddpm_t${AUX_NOISE_TIMESTEP}_lambda${lambda_tag}_miniimagenet_20way_train_5way_eval"
 
     echo "============================================================"
-    echo "running rho=${rho} lambda=${lambda}"
+    echo "running aux_noise=ddpm aux_t=${AUX_NOISE_TIMESTEP} lambda=${lambda}"
     echo "output_dir=${output_dir}"
     echo "============================================================"
 
@@ -49,8 +47,13 @@ for rho in "${RHO_LIST[@]}"; do
       --eval-noise-target none \
       --loss-type ce \
       --aux-denoise \
-      --noise-rho "${rho}" \
+      --train-schedule alternate \
+      --main-steps 5 \
+      --aux-steps 1 \
+      --aux-noise-mode ddpm \
+      --aux-noise-timestep "${AUX_NOISE_TIMESTEP}" \
       --lambda-denoise "${lambda}" \
+      --normalize-denoise-loss \
       --denoiser-hidden-multiplier 2 \
       --feature-normalization none \
       --distance-reduction mean \
@@ -69,5 +72,4 @@ for rho in "${RHO_LIST[@]}"; do
       --hidden-channels 64 \
       --encoder-head none \
       --embedding-dim 64
-  done
 done

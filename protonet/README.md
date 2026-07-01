@@ -278,21 +278,26 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --preload-data cuda \
   --preload-batch-size 1024 \
   --num-workers 4 \
-  --output-dir ./protonet/outputs/aux_denoise_rho02_miniimagenet_20way_train_5way_eval \
+  --output-dir ./protonet/outputs/aux_ddpm_t200_lambda0p3_miniimagenet_20way_train_5way_eval \
   --train-noise-timesteps 0 \
   --noise-space feature \
   --train-noise-target none \
   --eval-noise-target none \
   --loss-type ce \
   --aux-denoise \
-  --noise-rho 0.2 \
-  --lambda-denoise 0.1 \
+  --train-schedule alternate \
+  --main-steps 5 \
+  --aux-steps 1 \
+  --aux-noise-mode ddpm \
+  --aux-noise-timestep 200 \
+  --lambda-denoise 0.3 \
+  --normalize-denoise-loss \
   --denoiser-hidden-multiplier 2 \
   --feature-normalization none \
   --distance-reduction mean \
   --optimizer adam \
   --lr 1e-3 \
-  --lr-step-size 2000 \
+  --lr-step-size 0 \
   --lr-gamma 0.5 \
   --weight-decay 0 \
   --way 5 \
@@ -310,7 +315,7 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
 
 The default ProtoNet uses squared Euclidean distance without embedding normalization. `--encoder-head none` means Conv4 outputs the 64-channel pooled feature directly; `--encoder-head linear` restores the older extra projection head.
 
-To scan `rho in {0.1,0.2,0.3,0.5}` and `lambda-denoise in {0.1,0.05,0.3}` on GPU 1:
+To scan fixed DDPM auxiliary noise `t=200` and `lambda-denoise in {0.1,0.3,1.0}`:
 
 ```bash
 bash protonet/run_aux_grid.sh
@@ -319,7 +324,7 @@ bash protonet/run_aux_grid.sh
 To change GPU or shorten a dry run:
 
 ```bash
-GPU_ID=1 TRAIN_EPISODES=1000 EVAL_EPISODES=100 EVAL_INTERVAL=500 bash protonet/run_aux_grid.sh
+GPU_ID=1 TRAIN_EPISODES=1000 EVAL_EPISODES=100 EVAL_INTERVAL=500 AUX_NOISE_TIMESTEP=200 bash protonet/run_aux_grid.sh
 ```
 
 To reproduce the older image-noise ProtoNet baseline, add:

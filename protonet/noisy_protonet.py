@@ -430,6 +430,7 @@ def protonet_episode(
     schedule: DiffusionSchedule,
     noise_timestep: int,
     noise_target: str,
+    loss_mode: str = "joint",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     # 一个完整的 ProtoNet episode：
     # support/query 图像 -> embedding -> prototype -> query 距离 ->
@@ -489,16 +490,31 @@ def protonet_episode(
     else:
         raise ValueError(f"unsupported loss type: {args.loss_type}")
 
+    main_loss = loss
     denoise_loss = torch.zeros((), device=query_z.device)
     denoise_sigma = 0.0
-    if args.aux_denoise:
+    use_aux_loss = args.aux_denoise and loss_mode in {"joint", "aux"}
+    if use_aux_loss:
         if denoiser is None:
             raise ValueError("--aux-denoise requires a denoiser module")
-        # 相对噪声强度：sigma = rho * Std(z_q)。
-        # detach 后只把 sigma 当作当前 batch 的尺度估计，不让模型通过调节
-        # feature std 来投机地改变噪声强度。
-        denoise_sigma_tensor = args.noise_rho * query_z.detach().std(unbiased=False).clamp_min(1e-8)
-        noisy_query_z = query_z + denoise_sigma_tensor * torch.randn_like(query_z)
+        # 辅助任务里的 feature scale 只作为当前 batch 的尺度估计。
+        # detach 后不让模型通过调节 feature std 来投机地改变噪声强度。
+        feature_scale = query_z.detach().std(unbiased=False).clamp_min(1e-8)
+        if args.aux_noise_mode == "relative":
+            # 旧版局部高斯扰动：z_noisy = z + rho * Std(z) * eps。
+            denoise_sigma_tensor = args.noise_rho * feature_scale
+            noisy_query_z = query_z + denoise_sigma_tensor * torch.randn_like(query_z)
+        elif args.aux_noise_mode == "ddpm":
+            # DDPM 前向扩散版辅助任务：
+            # z_t = sqrt(alpha_bar_t) * z + sqrt(1-alpha_bar_t) * Std(z) * eps。
+            # target 仍是 clean prototype，表示从 t 步噪声特征还原到类别原型。
+            aux_t = min(max(args.aux_noise_timestep, 0), args.diffusion_steps - 1)
+            sqrt_ab = schedule.sqrt_alpha_bars[aux_t]
+            sqrt_omab = schedule.sqrt_one_minus_alpha_bars[aux_t]
+            denoise_sigma_tensor = sqrt_omab * feature_scale
+            noisy_query_z = sqrt_ab * query_z + denoise_sigma_tensor * torch.randn_like(query_z)
+        else:
+            raise ValueError(f"unsupported auxiliary noise mode: {args.aux_noise_mode}")
         denoised_query_z = denoiser(noisy_query_z)
         target_proto = prototypes[query_y].detach()
         denoise_loss = pairwise_squared_distance(
@@ -506,8 +522,19 @@ def protonet_episode(
             target_proto,
             args.distance_reduction,
         ).diag().mean()
-        loss = loss + args.lambda_denoise * denoise_loss
+        if args.normalize_denoise_loss:
+            denoise_loss = denoise_loss / denoise_sigma_tensor.pow(2).clamp_min(1e-8)
         denoise_sigma = float(denoise_sigma_tensor.item())
+    if loss_mode == "joint":
+        loss = main_loss + args.lambda_denoise * denoise_loss
+    elif loss_mode == "main":
+        loss = main_loss
+    elif loss_mode == "aux":
+        if not args.aux_denoise:
+            raise ValueError("loss_mode=aux requires --aux-denoise")
+        loss = args.lambda_denoise * denoise_loss
+    else:
+        raise ValueError(f"unsupported loss mode: {loss_mode}")
 
     preds = distances.argmin(dim=1)
     true_dist = distances[torch.arange(query_y.numel(), device=query_y.device), query_y]
@@ -523,7 +550,9 @@ def protonet_episode(
     metrics.update(loss_parts)
     metrics.update(
         {
+            "main_loss": float(main_loss.item()),
             "denoise_loss": float(denoise_loss.item()),
+            "weighted_denoise_loss": float((args.lambda_denoise * denoise_loss).item()),
             "denoise_sigma": denoise_sigma,
         }
     )
@@ -672,6 +701,7 @@ def evaluate(
                 schedule,
                 eval_noise_timestep,
                 args.eval_noise_target,
+                loss_mode="main",
             )
             rows.append(metrics)
     return mean_metrics(rows)
@@ -734,6 +764,19 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
         encoder.train()
         if denoiser is not None:
             denoiser.train()
+        loss_mode = "joint"
+        train_phase = "joint"
+        if args.train_schedule == "alternate":
+            if not args.aux_denoise:
+                raise ValueError("--train-schedule alternate requires --aux-denoise")
+            cycle_steps = args.main_steps + args.aux_steps
+            cycle_pos = (episode - 1) % cycle_steps
+            if cycle_pos < args.main_steps:
+                loss_mode = "main"
+                train_phase = "main"
+            else:
+                loss_mode = "aux"
+                train_phase = "aux"
         # 每次迭代都采样一个新的随机 episode。
         support_x, support_y, query_x, query_y = train_indexed.sample_episode(
             train_way,
@@ -754,6 +797,7 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
             schedule,
             train_noise_timestep,
             args.train_noise_target,
+            loss_mode=loss_mode,
         )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -774,41 +818,37 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
                 eval_noise_timestep=0,
                 eval_way=eval_way,
             )
-            eval_same = evaluate(
-                encoder,
-                denoiser,
-                test_indexed,
-                args,
-                device,
-                seed=args.seed + 60_000 + episode,
-                eval_noise_timestep=train_noise_timestep,
-                eval_way=eval_way,
-            )
             row = {
                 "train_noise_timestep": train_noise_timestep,
-                "noise_rho": args.noise_rho if args.aux_denoise else 0.0,
+                "aux_noise_mode": args.aux_noise_mode if args.aux_denoise else "none",
+                "aux_noise_timestep": args.aux_noise_timestep if args.aux_denoise else 0,
+                "noise_rho": args.noise_rho if args.aux_denoise and args.aux_noise_mode == "relative" else 0.0,
                 "episode": episode,
+                "train_phase": train_phase,
                 "train_way": train_way,
                 "eval_way": eval_way,
                 "lr": optimizer.param_groups[0]["lr"],
                 "train_loss": float(loss.item()),
+                "main_loss": train_metrics["main_loss"],
+                "denoise_loss": train_metrics["denoise_loss"],
+                "weighted_denoise_loss": train_metrics["weighted_denoise_loss"],
+                "denoise_sigma": train_metrics["denoise_sigma"],
                 "train_acc": train_metrics["acc"],
+                "train_margin": train_metrics["margin"],
                 "eval_clean_acc": eval_clean["acc"],
                 "eval_clean_margin": eval_clean["margin"],
-                "eval_same_noise_acc": eval_same["acc"],
-                "eval_same_noise_margin": eval_same["margin"],
                 "positive_loss": train_metrics["positive_loss"],
                 "contrast_loss": train_metrics["contrast_loss"],
                 "proto_sep_loss": train_metrics["proto_sep_loss"],
                 "variance_loss": train_metrics["variance_loss"],
-                "denoise_loss": train_metrics["denoise_loss"],
-                "denoise_sigma": train_metrics["denoise_sigma"],
             }
             rows.append(row)
             print(
-                f"t={train_noise_timestep} episode={episode} loss={loss.item():.4f} "
+                f"t={train_noise_timestep} episode={episode} phase={train_phase} "
+                f"loss={loss.item():.4f} main_loss={train_metrics['main_loss']:.4f} "
+                f"denoise_loss={train_metrics['denoise_loss']:.4f} "
                 f"train_acc={train_metrics['acc']:.4f} clean_acc={eval_clean['acc']:.4f} "
-                f"same_noise_acc={eval_same['acc']:.4f}"
+                f"clean_margin={eval_clean['margin']:.4f}"
             )
     return rows
 
@@ -835,8 +875,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-noise-target", choices=["none", "support", "query", "both"], default="query")
     parser.add_argument("--loss-type", choices=["distance", "ce"], default="distance")
     parser.add_argument("--aux-denoise", action="store_true")
+    parser.add_argument("--train-schedule", choices=["joint", "alternate"], default="joint")
+    parser.add_argument("--main-steps", type=int, default=5, help="Main-task episodes per cycle when --train-schedule alternate.")
+    parser.add_argument("--aux-steps", type=int, default=1, help="Auxiliary episodes per cycle when --train-schedule alternate.")
     parser.add_argument("--noise-rho", type=float, default=0.2)
+    parser.add_argument("--aux-noise-mode", choices=["relative", "ddpm"], default="relative")
+    parser.add_argument("--aux-noise-timestep", type=int, default=200)
     parser.add_argument("--lambda-denoise", type=float, default=0.1)
+    parser.add_argument("--normalize-denoise-loss", action="store_true")
     parser.add_argument("--denoiser-hidden-multiplier", type=int, default=2)
     parser.add_argument("--feature-normalization", choices=["none", "layernorm", "l2"], default="layernorm")
     parser.add_argument("--distance-reduction", choices=["mean", "sum"], default="mean")
