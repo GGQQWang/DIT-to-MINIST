@@ -160,6 +160,61 @@ class HFMiniImageNetDataset:
         return image, self.targets[idx]
 
 
+class PreloadedDataset:
+    """把图像数据预先转成 tensor，减少训练时的 PIL/transform 开销。"""
+
+    def __init__(self, images: torch.Tensor, targets: torch.Tensor, classes: Sequence[str]):
+        self.images = images
+        self.targets = targets
+        self.classes = list(classes)
+
+    def __len__(self) -> int:
+        return int(self.targets.numel())
+
+    def __getitem__(self, idx: int):
+        return self.images[idx], int(self.targets[idx].item())
+
+
+def preload_dataset(dataset, device: torch.device, args: argparse.Namespace, split_name: str):
+    """可选把整个 split 预加载到 CPU 或 GPU tensor。
+
+    miniImageNet 84x84 float32 大约每张 84KB，全部 train/val/test 放到
+    A6000 48GB 显存里通常没有压力。这样 episode 采样时不再反复解码图片。
+    """
+    if args.preload_data == "none":
+        return dataset
+
+    target_device = device if args.preload_data == "cuda" else torch.device("cpu")
+    classes = getattr(dataset, "classes", [])
+    loader = DataLoader(
+        dataset,
+        batch_size=args.preload_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(target_device.type == "cuda"),
+    )
+    images = []
+    targets = []
+    total = len(dataset)
+    seen = 0
+    print(f"preloading split={split_name} target={target_device} samples={total}", flush=True)
+    for batch_images, batch_targets in loader:
+        images.append(batch_images.to(target_device, non_blocking=True))
+        targets.append(batch_targets.to(target_device, non_blocking=True).long())
+        seen += int(batch_images.shape[0])
+        if seen == total or seen % max(args.preload_batch_size * 20, 1) == 0:
+            print(f"  preloaded {seen}/{total}", flush=True)
+
+    images_tensor = torch.cat(images, dim=0)
+    targets_tensor = torch.cat(targets, dim=0)
+    print(
+        f"preloaded split={split_name} shape={tuple(images_tensor.shape)} "
+        f"device={images_tensor.device}",
+        flush=True,
+    )
+    return PreloadedDataset(images_tensor, targets_tensor, classes)
+
+
 class ConvBlock(nn.Module):
     """一个 Conv4 block：Conv-BN-ReLU-MaxPool。这里不使用 dropout。"""
 
@@ -631,6 +686,8 @@ def train_one_setting(args: argparse.Namespace, train_noise_timestep: int) -> Li
 
     train_dataset, in_channels, num_classes = build_dataset(args, train=True)
     test_dataset, _, test_num_classes = build_dataset(args, train=False)
+    train_dataset = preload_dataset(train_dataset, device, args, "train")
+    test_dataset = preload_dataset(test_dataset, device, args, args.eval_split)
     train_indexed = IndexedDataset(train_dataset, num_classes)
     test_indexed = IndexedDataset(test_dataset, test_num_classes)
     train_way = args.train_way if args.train_way > 0 else args.way
@@ -768,6 +825,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-dataset-id", default="GATE-engine/mini_imagenet")
     parser.add_argument("--eval-split", choices=["val", "test"], default="test", help="Evaluation split for ImageFolder datasets.")
     parser.add_argument("--image-size", type=int, default=84, help="Image size for miniImageNet.")
+    parser.add_argument("--preload-data", choices=["none", "cpu", "cuda"], default="none")
+    parser.add_argument("--preload-batch-size", type=int, default=1024)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--train-noise-timesteps", default="0,100,200,250,300,400,500")
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--noise-space", choices=["feature", "image"], default="feature")

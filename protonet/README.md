@@ -247,7 +247,7 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --distance-reduction mean \
   --optimizer adam \
   --lr 1e-3 \
-  --lr-step-size 2000 \
+  --lr-step-size 0 \
   --lr-gamma 0.5 \
   --weight-decay 0 \
   --way 5 \
@@ -275,6 +275,9 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
   --hf-dataset-id GATE-engine/mini_imagenet \
   --eval-split test \
   --image-size 84 \
+  --preload-data cuda \
+  --preload-batch-size 1024 \
+  --num-workers 4 \
   --output-dir ./protonet/outputs/aux_denoise_rho02_miniimagenet_20way_train_5way_eval \
   --train-noise-timesteps 0 \
   --noise-space feature \
@@ -306,6 +309,18 @@ CUDA_VISIBLE_DEVICES=1 python protonet/noisy_protonet.py \
 ```
 
 The default ProtoNet uses squared Euclidean distance without embedding normalization. `--encoder-head none` means Conv4 outputs the 64-channel pooled feature directly; `--encoder-head linear` restores the older extra projection head.
+
+To scan `rho in {0.1,0.2,0.3,0.5}` and `lambda-denoise in {0.1,0.05,0.3}` on GPU 1:
+
+```bash
+bash protonet/run_aux_grid.sh
+```
+
+To change GPU or shorten a dry run:
+
+```bash
+GPU_ID=1 TRAIN_EPISODES=1000 EVAL_EPISODES=100 EVAL_INTERVAL=500 bash protonet/run_aux_grid.sh
+```
 
 To reproduce the older image-noise ProtoNet baseline, add:
 
